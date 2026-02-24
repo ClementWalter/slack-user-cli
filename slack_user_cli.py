@@ -17,9 +17,11 @@ or browser DevTools. No Slack app registration needed.
 
 import json
 import logging
+import re
 import subprocess
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 import click
 from rich.console import Console
@@ -316,6 +318,44 @@ def resolve_channel(client: WebClient, name_or_id: str, workspace: str = "") -> 
                 break
 
     raise click.ClickException(f"Channel '{name_or_id}' not found.")
+
+
+# -- URL parsing --------------------------------------------------------------
+
+# Slack permalink pattern: https://<workspace>.slack.com/archives/<channel>/p<ts>
+_SLACK_URL_PATH_RE = re.compile(r"^/archives/([CDG][A-Z0-9]+)/p(\d{16})$")
+
+
+def parse_slack_url(url: str) -> tuple[str, str, str]:
+    """Parse a Slack permalink into (workspace_domain, channel_id, message_ts).
+
+    Slack permalinks follow: https://<workspace>.slack.com/archives/<channel>/p<ts>
+    The timestamp is encoded without the dot; we re-insert it before the last 6 digits.
+
+    Raises click.ClickException on invalid URL.
+    """
+    parsed = urlparse(url)
+    hostname = parsed.hostname or ""
+
+    # Validate <workspace>.slack.com
+    if not hostname.endswith(".slack.com"):
+        raise click.ClickException(
+            f"Not a Slack URL (expected *.slack.com): {url}"
+        )
+    workspace = hostname.removesuffix(".slack.com")
+
+    match = _SLACK_URL_PATH_RE.match(parsed.path)
+    if not match:
+        raise click.ClickException(
+            f"Malformed Slack permalink path: {parsed.path}"
+        )
+
+    channel_id = match.group(1)
+    raw_ts = match.group(2)
+    # Insert dot before last 6 digits: 1771329371503939 → 1771329371.503939
+    message_ts = f"{raw_ts[:-6]}.{raw_ts[-6:]}"
+
+    return workspace, channel_id, message_ts
 
 
 # -- CLI group ----------------------------------------------------------------
@@ -782,6 +822,60 @@ def thread(ctx: click.Context, channel: str, ts: str, limit: int, is_dm: bool) -
 
     replies = replies[:limit]
     _print_messages(client, replies, workspace=ws)
+
+
+# -- url (permalink reader) ---------------------------------------------------
+
+
+@cli.command(name="url")
+@click.argument("slack_url")
+@click.option("--limit", default=50, help="Number of messages to show.")
+@click.pass_context
+def url_command(ctx: click.Context, slack_url: str, limit: int) -> None:
+    """Read a Slack thread from a permalink URL.
+
+    Parses a Slack permalink and fetches the thread (or surrounding context
+    for standalone messages). This lets agents read threads directly from
+    pasted URLs without manual channel/ts extraction.
+    """
+    _workspace, channel_id, message_ts = parse_slack_url(slack_url)
+    client = get_client(workspace=ctx.obj["workspace"])
+    ws = ctx.obj["workspace_name"]
+
+    # Try fetching as a thread first
+    replies: list[dict] = []
+    cursor = None
+    while len(replies) < limit:
+        kwargs: dict = {
+            "channel": channel_id,
+            "ts": message_ts,
+            "limit": min(limit - len(replies), 200),
+        }
+        if cursor:
+            kwargs["cursor"] = cursor
+        try:
+            resp = client.conversations_replies(**kwargs)
+        except SlackApiError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+        replies.extend(resp.get("messages", []))
+        cursor = resp.get("response_metadata", {}).get("next_cursor")
+        if not cursor:
+            break
+
+    # If only one message (standalone, no thread), show surrounding context
+    if len(replies) <= 1:
+        try:
+            hist = client.conversations_history(
+                channel=channel_id, latest=message_ts, limit=limit, inclusive=True
+            )
+        except SlackApiError as exc:
+            raise click.ClickException(str(exc)) from exc
+        messages = list(reversed(hist.get("messages", [])))
+        _print_messages(client, messages, workspace=ws)
+    else:
+        replies = replies[:limit]
+        _print_messages(client, replies, workspace=ws)
 
 
 # -- users --------------------------------------------------------------------

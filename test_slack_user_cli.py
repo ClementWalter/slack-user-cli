@@ -34,6 +34,7 @@ from slack_user_cli import (
     get_client,
     get_workspace_config,
     load_config,
+    parse_slack_url,
     resolve_channel,
     resolve_user,
     save_config,
@@ -1172,3 +1173,82 @@ class TestWorkspaceSwitch:
 
         runner.invoke(cli, ["-w", "testteam", "channels"])
         mock_get_client.assert_called_once_with(workspace="testteam")
+
+
+# -- parse_slack_url tests ----------------------------------------------------
+
+
+class TestParseSlackUrl:
+    def test_extracts_channel_id(self):
+        _ws, channel_id, _ts = parse_slack_url(
+            "https://zama-ai.slack.com/archives/C0ADHDQ3QH1/p1771329371503939"
+        )
+        assert channel_id == "C0ADHDQ3QH1"
+
+    def test_extracts_ts(self):
+        _ws, _ch, ts = parse_slack_url(
+            "https://zama-ai.slack.com/archives/C0ADHDQ3QH1/p1771329371503939"
+        )
+        assert ts == "1771329371.503939"
+
+    def test_extracts_workspace(self):
+        workspace, _ch, _ts = parse_slack_url(
+            "https://zama-ai.slack.com/archives/C0ADHDQ3QH1/p1771329371503939"
+        )
+        assert workspace == "zama-ai"
+
+    def test_rejects_non_slack_url(self):
+        with pytest.raises(Exception, match="Not a Slack URL"):
+            parse_slack_url("https://example.com/archives/C123/p1234567890123456")
+
+    def test_rejects_malformed_path(self):
+        with pytest.raises(Exception, match="Malformed Slack permalink"):
+            parse_slack_url("https://team.slack.com/messages/C123")
+
+
+# -- url command tests --------------------------------------------------------
+
+
+class TestUrlCommand:
+    @patch("slack_user_cli.get_client")
+    def test_reads_thread(self, mock_get_client, runner, saved_config):
+        """url command calls conversations_replies with parsed channel+ts."""
+        mock_client = MagicMock()
+        mock_client.conversations_replies.return_value = {
+            "messages": [
+                {"user": "U1", "text": "parent", "ts": "1771329371.503939"},
+                {"user": "U2", "text": "reply", "ts": "1771329372.000000"},
+            ],
+            "response_metadata": {"next_cursor": ""},
+        }
+        mock_client.users_info.return_value = {
+            "user": {"profile": {"display_name": "alice"}}
+        }
+        mock_get_client.return_value = mock_client
+
+        result = runner.invoke(
+            cli,
+            ["url", "https://zama-ai.slack.com/archives/C0ADHDQ3QH1/p1771329371503939"],
+        )
+        mock_client.conversations_replies.assert_called_once()
+
+    @patch("slack_user_cli.get_client")
+    def test_shows_message_text(self, mock_get_client, runner, saved_config):
+        mock_client = MagicMock()
+        mock_client.conversations_replies.return_value = {
+            "messages": [
+                {"user": "U1", "text": "important update", "ts": "1771329371.503939"},
+                {"user": "U2", "text": "thanks!", "ts": "1771329372.000000"},
+            ],
+            "response_metadata": {"next_cursor": ""},
+        }
+        mock_client.users_info.return_value = {
+            "user": {"profile": {"display_name": "bob"}}
+        }
+        mock_get_client.return_value = mock_client
+
+        result = runner.invoke(
+            cli,
+            ["url", "https://zama-ai.slack.com/archives/C0ADHDQ3QH1/p1771329371503939"],
+        )
+        assert "important update" in result.output
