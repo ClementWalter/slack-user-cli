@@ -1,0 +1,2136 @@
+#!/usr/bin/env -S uv run
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "slack-sdk>=3.33",
+#     "slacktokens>=0.2.6",
+#     "click>=8.0",
+#     "rich>=13.0",
+#     "requests>=2.31",
+# ]
+# ///
+"""Slack User CLI — terminal access to Slack using browser session credentials.
+
+Provides read/write access to Slack channels, DMs, threads, and search
+using xoxc- tokens and d cookies extracted from the Slack desktop app
+or browser DevTools. No Slack app registration needed.
+"""
+
+import json
+import logging
+import re
+import subprocess
+import time
+from pathlib import Path
+from urllib.parse import urlparse
+
+import click
+from rich.console import Console
+from rich.table import Table
+from rich.text import Text
+from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
+
+logger = logging.getLogger(__name__)
+
+# -- Config management --------------------------------------------------------
+
+CONFIG_DIR = Path.home() / ".config" / "slack-user-cli"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+console = Console()
+
+
+def load_config() -> dict:
+    """Load config from disk, returning empty dict if missing.
+
+    Migrates legacy single-workspace format to multi-workspace on read.
+    """
+    if not CONFIG_FILE.exists():
+        return {}
+    config = json.loads(CONFIG_FILE.read_text())
+    # Migrate legacy format: {token, cookie, team, user} → multi-workspace
+    if "token" in config and "workspaces" not in config:
+        team = config.get("team", "default")
+        config = {
+            "cookie": config.get("cookie", ""),
+            "default": team,
+            "workspaces": {
+                team: {
+                    "token": config["token"],
+                    "team": team,
+                    "user": config.get("user", ""),
+                }
+            },
+        }
+        save_config(config)
+    return config
+
+
+def save_config(config: dict) -> None:
+    """Persist config to disk, creating parent dirs as needed."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(config, indent=2))
+
+
+def get_workspace_config(config: dict, workspace: str | None) -> dict:
+    """Extract token + cookie for a specific workspace.
+
+    Returns a dict with 'token' and 'cookie' keys ready for WebClient.
+    """
+    workspaces = config.get("workspaces", {})
+    cookie = config.get("cookie", "")
+
+    if not workspaces:
+        raise click.ClickException(
+            "Not logged in. Run 'login' first to set credentials."
+        )
+
+    if workspace is None:
+        workspace = config.get("default", "")
+
+    if workspace not in workspaces:
+        available = ", ".join(workspaces.keys())
+        raise click.ClickException(
+            f"Workspace '{workspace}' not found. Available: {available}"
+        )
+
+    ws = workspaces[workspace]
+    return {"token": ws["token"], "cookie": cookie}
+
+
+def get_client(config: dict | None = None, workspace: str | None = None) -> WebClient:
+    """Build an authenticated WebClient from stored credentials.
+
+    The xoxc- token goes in the standard token param while the d cookie
+    must be injected via a custom Cookie header — this mirrors how the
+    Slack web client authenticates.
+    """
+    if config is None:
+        config = load_config()
+    ws = get_workspace_config(config, workspace)
+    token = ws.get("token")
+    cookie = ws.get("cookie")
+    if not token or not cookie:
+        raise click.ClickException(
+            "Not logged in. Run 'login' first to set credentials."
+        )
+    return WebClient(token=token, headers={"cookie": f"d={cookie}"})
+
+
+# -- Disk-backed cache --------------------------------------------------------
+
+# Cache TTL: 1 hour — channels and users rarely change
+CACHE_TTL_SECONDS = 3600
+
+# In-memory user display name cache (populated from disk + API)
+_user_cache: dict[str, str] = {}
+
+
+def _cache_path(workspace: str, kind: str) -> Path:
+    """Return the cache file path for a workspace and cache kind.
+
+    Derived from CONFIG_DIR at call time so monkeypatching works in tests.
+    """
+    return CONFIG_DIR / "cache" / workspace / f"{kind}.json"
+
+
+def _load_cache(workspace: str, kind: str) -> dict | None:
+    """Load a cache file if it exists and hasn't expired."""
+    path = _cache_path(workspace, kind)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    # Check TTL
+    if time.time() - data.get("ts", 0) > CACHE_TTL_SECONDS:
+        logger.debug("Cache expired for %s/%s", workspace, kind)
+        return None
+    return data.get("data")
+
+
+def _save_cache(workspace: str, kind: str, data: dict) -> None:
+    """Save data to a cache file with a timestamp."""
+    path = _cache_path(workspace, kind)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"ts": time.time(), "data": data}))
+
+
+def _get_active_workspace(config: dict | None = None, workspace: str | None = None) -> str:
+    """Resolve the active workspace name for cache keying."""
+    if config is None:
+        config = load_config()
+    if workspace is None:
+        workspace = config.get("default", "")
+    return workspace
+
+
+def build_channel_cache(client: WebClient, workspace: str) -> dict[str, str]:
+    """Fetch all channels and build a name→id mapping, saving to disk."""
+    name_to_id: dict[str, str] = {}
+    cursor = None
+    while True:
+        kwargs: dict = {
+            "types": "public_channel,private_channel,mpim,im",
+            "limit": 200,
+        }
+        if cursor:
+            kwargs["cursor"] = cursor
+        resp = client.conversations_list(**kwargs)
+        for ch in resp["channels"]:
+            name = ch.get("name", "")
+            if name:
+                name_to_id[name] = ch["id"]
+        cursor = resp.get("response_metadata", {}).get("next_cursor")
+        if not cursor:
+            break
+    _save_cache(workspace, "channels", name_to_id)
+    logger.debug("Cached %d channels for %s", len(name_to_id), workspace)
+    return name_to_id
+
+
+def build_user_cache(client: WebClient, workspace: str) -> dict:
+    """Fetch all users and build lookup maps, saving to disk.
+
+    Returns dict with:
+      - id_to_display: {user_id: display_name}
+      - name_to_id: {username: user_id}
+      - display_to_id: {display_name: user_id}
+    """
+    id_to_display: dict[str, str] = {}
+    name_to_id: dict[str, str] = {}
+    display_to_id: dict[str, str] = {}
+    cursor = None
+    while True:
+        kwargs: dict = {"limit": 200}
+        if cursor:
+            kwargs["cursor"] = cursor
+        resp = client.users_list(**kwargs)
+        for member in resp["members"]:
+            uid = member["id"]
+            username = member.get("name", "")
+            profile = member.get("profile", {})
+            display = profile.get("display_name") or member.get("real_name") or username
+            id_to_display[uid] = display
+            if username:
+                name_to_id[username] = uid
+            if profile.get("display_name"):
+                display_to_id[profile["display_name"]] = uid
+        cursor = resp.get("response_metadata", {}).get("next_cursor")
+        if not cursor:
+            break
+    data = {
+        "id_to_display": id_to_display,
+        "name_to_id": name_to_id,
+        "display_to_id": display_to_id,
+    }
+    _save_cache(workspace, "users", data)
+    logger.debug("Cached %d users for %s", len(id_to_display), workspace)
+    return data
+
+
+def _get_channel_cache(client: WebClient, workspace: str) -> dict[str, str]:
+    """Get channel name→id map from cache or API."""
+    cached = _load_cache(workspace, "channels")
+    if cached is not None:
+        return cached
+    return build_channel_cache(client, workspace)
+
+
+def _get_user_cache(client: WebClient, workspace: str) -> dict:
+    """Get user lookup maps from cache or API."""
+    cached = _load_cache(workspace, "users")
+    if cached is not None:
+        return cached
+    return build_user_cache(client, workspace)
+
+
+def resolve_user(client: WebClient, user_id: str, workspace: str = "") -> str:
+    """Resolve a Slack user ID to a display name, using disk cache.
+
+    Only reads the disk cache passively — never triggers a full users_list
+    build. This keeps individual user lookups fast and avoids pagination
+    storms when the cache hasn't been built yet.
+    """
+    if user_id in _user_cache:
+        return _user_cache[user_id]
+
+    # Passively check disk cache (no API call if missing)
+    if workspace:
+        cached = _load_cache(workspace, "users")
+        if cached is not None:
+            name = cached.get("id_to_display", {}).get(user_id)
+            if name:
+                _user_cache[user_id] = name
+                return name
+
+    # Fall back to single API call for unknown users
+    try:
+        resp = client.users_info(user=user_id)
+        user = resp["user"]
+        name = (
+            user.get("profile", {}).get("display_name")
+            or user.get("real_name")
+            or user_id
+        )
+        _user_cache[user_id] = name
+        return name
+    except SlackApiError:
+        logger.debug("Failed to resolve user %s", user_id)
+        _user_cache[user_id] = user_id
+        return user_id
+
+
+def resolve_channel(client: WebClient, name_or_id: str, workspace: str = "") -> str:
+    """Resolve a channel name (without #) to its ID, or pass through an ID."""
+    # Already an ID — starts with C, D, or G
+    if name_or_id[0] in ("C", "D", "G") and name_or_id[1:].isalnum():
+        return name_or_id
+
+    # Check disk cache first
+    if workspace:
+        channel_map = _get_channel_cache(client, workspace)
+        if name_or_id in channel_map:
+            return channel_map[name_or_id]
+
+    # Cache miss — walk the API (and rebuild cache while we're at it)
+    channel_map = build_channel_cache(client, workspace) if workspace else {}
+    if name_or_id in channel_map:
+        return channel_map[name_or_id]
+
+    # Final fallback: paginate without caching (no workspace context)
+    if not workspace:
+        cursor = None
+        while True:
+            kwargs: dict = {
+                "types": "public_channel,private_channel,mpim,im",
+                "limit": 200,
+            }
+            if cursor:
+                kwargs["cursor"] = cursor
+            resp = client.conversations_list(**kwargs)
+            for ch in resp["channels"]:
+                if ch.get("name") == name_or_id:
+                    return ch["id"]
+            cursor = resp.get("response_metadata", {}).get("next_cursor")
+            if not cursor:
+                break
+
+    raise click.ClickException(f"Channel '{name_or_id}' not found.")
+
+
+# -- URL parsing --------------------------------------------------------------
+
+# Slack permalink pattern: https://<workspace>.slack.com/archives/<channel>/p<ts>
+_SLACK_URL_PATH_RE = re.compile(r"^/archives/([CDG][A-Z0-9]+)/p(\d{16})$")
+
+
+def parse_slack_url(url: str) -> tuple[str, str, str]:
+    """Parse a Slack permalink into (workspace_domain, channel_id, message_ts).
+
+    Slack permalinks follow: https://<workspace>.slack.com/archives/<channel>/p<ts>
+    The timestamp is encoded without the dot; we re-insert it before the last 6 digits.
+
+    Raises click.ClickException on invalid URL.
+    """
+    parsed = urlparse(url)
+    hostname = parsed.hostname or ""
+
+    # Validate <workspace>.slack.com
+    if not hostname.endswith(".slack.com"):
+        raise click.ClickException(
+            f"Not a Slack URL (expected *.slack.com): {url}"
+        )
+    workspace = hostname.removesuffix(".slack.com")
+
+    match = _SLACK_URL_PATH_RE.match(parsed.path)
+    if not match:
+        raise click.ClickException(
+            f"Malformed Slack permalink path: {parsed.path}"
+        )
+
+    channel_id = match.group(1)
+    raw_ts = match.group(2)
+    # Insert dot before last 6 digits: 1771329371503939 → 1771329371.503939
+    message_ts = f"{raw_ts[:-6]}.{raw_ts[-6:]}"
+
+    return workspace, channel_id, message_ts
+
+
+# Canvas URL pattern: https://<workspace>.slack.com/docs/<team_id>/<file_id>
+_CANVAS_URL_PATH_RE = re.compile(r"^/docs/([A-Z0-9]+)/([A-Z0-9]+)$")
+
+
+def parse_canvas_url(url: str) -> str:
+    """Extract the file ID from a Slack canvas URL.
+
+    Canvas URLs follow: https://<workspace>.slack.com/docs/<team_id>/<file_id>
+    Returns the file_id needed for the files.info API call.
+    """
+    parsed = urlparse(url)
+    hostname = parsed.hostname or ""
+
+    if not hostname.endswith(".slack.com"):
+        raise click.ClickException(
+            f"Not a Slack URL (expected *.slack.com): {url}"
+        )
+
+    match = _CANVAS_URL_PATH_RE.match(parsed.path)
+    if not match:
+        raise click.ClickException(
+            f"Malformed Slack canvas URL path: {parsed.path}"
+        )
+
+    return match.group(2)
+
+
+def _fetch_canvas_content(client: WebClient, file_id: str) -> tuple[str, str]:
+    """Fetch canvas HTML content via files.info private URL.
+
+    Returns (title, html_content). The canvas is stored as a Quip document
+    accessible through the file's url_private endpoint.
+    """
+    import requests  # noqa: PLC0415
+
+    try:
+        resp = client.api_call("files.info", params={"file": file_id})
+    except SlackApiError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    file_info = resp.get("file", {})
+    title = file_info.get("title", "Untitled")
+    url_private = file_info.get("url_private")
+
+    if not url_private:
+        raise click.ClickException(
+            f"No private URL found for file {file_id}. "
+            "The canvas may not be accessible."
+        )
+
+    # Download content using the same auth headers as the WebClient
+    headers = dict(client.headers or {})
+    headers["Authorization"] = f"Bearer {client.token}"
+    dl_resp = requests.get(url_private, headers=headers, timeout=30)
+    dl_resp.raise_for_status()
+
+    return title, dl_resp.text
+
+
+def _html_to_text(html: str) -> str:
+    """Convert simple canvas HTML to readable plain text.
+
+    Handles headings, lists, links, and paragraphs without requiring
+    a full HTML parser — canvases use a small, predictable HTML subset.
+    """
+    text = html
+    # Convert headings to markdown-style
+    text = re.sub(r"<h1[^>]*>(.*?)</h1>", r"# \1\n", text)
+    text = re.sub(r"<h2[^>]*>(.*?)</h2>", r"## \1\n", text)
+    text = re.sub(r"<h3[^>]*>(.*?)</h3>", r"### \1\n", text)
+    # Convert links to markdown
+    text = re.sub(r'<a\s+href="([^"]*)"[^>]*>(.*?)</a>', r"[\2](\1)", text)
+    # Convert list items
+    text = re.sub(r"<li[^>]*>(.*?)</li>", r"- \1", text)
+    # Line breaks
+    text = re.sub(r"<br\s*/?>", "\n", text)
+    # Strip remaining tags
+    text = re.sub(r"<[^>]+>", "", text)
+    # Clean up whitespace
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    # Decode HTML entities
+    text = text.replace("&amp;", "&")
+    text = text.replace("&lt;", "<")
+    text = text.replace("&gt;", ">")
+    text = text.replace("&quot;", '"')
+    text = text.replace("&#39;", "'")
+    text = text.replace("\u200b", "")  # zero-width space
+    return text.strip()
+
+
+# -- CLI group ----------------------------------------------------------------
+
+
+@click.group()
+@click.option(
+    "--debug", is_flag=True, default=False, help="Enable debug logging."
+)
+@click.option(
+    "-w",
+    "--workspace",
+    default=None,
+    help="Workspace name to use (defaults to the default workspace).",
+)
+@click.pass_context
+def cli(ctx: click.Context, debug: bool, workspace: str | None) -> None:
+    """Slack User CLI — read and write Slack from your terminal."""
+    level = logging.DEBUG if debug else logging.WARNING
+    logging.basicConfig(level=level, format="%(levelname)s: %(message)s")
+    # Resolve and store the active workspace name for cache keying
+    ctx.ensure_object(dict)
+    ctx.obj["workspace"] = workspace
+    config = load_config()
+    ctx.obj["workspace_name"] = _get_active_workspace(config, workspace)
+
+
+# -- login --------------------------------------------------------------------
+
+
+@cli.command()
+@click.option(
+    "--auto",
+    "mode",
+    flag_value="auto",
+    help="Extract credentials from Slack desktop app.",
+)
+@click.option(
+    "--manual",
+    "mode",
+    flag_value="manual",
+    help="Paste credentials from browser DevTools (one workspace).",
+)
+@click.option(
+    "--browser",
+    "mode",
+    flag_value="browser",
+    help="Paste localStorage JSON from browser to import all workspaces.",
+)
+@click.option(
+    "--workspace-name",
+    default=None,
+    help="Name for this workspace (manual mode only).",
+)
+def login(mode: str | None, workspace_name: str | None) -> None:
+    """Authenticate with Slack using session credentials.
+
+    Three modes:
+      --auto     Extract from Slack desktop app (all workspaces).
+      --browser  Paste browser localStorage JSON (all workspaces).
+      --manual   Paste a single xoxc- token + d cookie.
+    """
+    if mode is None:
+        mode = "auto"
+
+    config = load_config()
+    config.setdefault("workspaces", {})
+
+    if mode == "auto":
+        _login_auto(config)
+    elif mode == "browser":
+        _login_browser(config)
+    else:
+        _login_manual(config, workspace_name)
+
+    save_config(config)
+
+    # Show summary of all workspaces
+    ws_count = len(config.get("workspaces", {}))
+    default = config.get("default", "")
+    if ws_count > 1:
+        console.print(
+            f"\n[bold]{ws_count} workspaces saved.[/] "
+            f"Default: [cyan]{default}[/]"
+        )
+        console.print(
+            "[dim]Use -w <name> to switch, or 'workspaces' to list all.[/]"
+        )
+
+
+def _login_auto(config: dict) -> None:
+    """Extract credentials from Slack desktop app via slacktokens."""
+    try:
+        from slacktokens import get_tokens_and_cookie  # noqa: PLC0415
+    except ImportError as exc:
+        raise click.ClickException(
+            "slacktokens not available. Use --manual or --browser instead."
+        ) from exc
+
+    console.print(
+        "[yellow]Extracting credentials from Slack desktop app…[/]"
+    )
+    console.print(
+        "[dim]Note: close Slack desktop first (LevelDB lock) "
+        "and allow Keychain access when prompted.[/]"
+    )
+    result = get_tokens_and_cookie()
+    cookie = result.get("cookie", "")
+    config["cookie"] = cookie
+
+    # slacktokens returns {cookie: str, tokens: {workspace: token, ...}}
+    tokens = result.get("tokens", {})
+    if not tokens:
+        raise click.ClickException(
+            "No tokens found. Is Slack desktop installed and logged in?"
+        )
+
+    _validate_and_save_tokens(config, tokens, cookie)
+
+
+def _get_cookie_auto_or_prompt(config: dict) -> str:
+    """Try to extract the d cookie from the Slack desktop app, fall back to prompt.
+
+    The d cookie expires frequently and is httpOnly (can't be read via JS).
+    The Slack desktop app stores it locally, so we try that first.
+    """
+    try:
+        from slacktokens import get_cookie  # noqa: PLC0415
+
+        console.print(
+            "[yellow]Extracting d cookie from Slack desktop app…[/]"
+        )
+        result = get_cookie()
+        # get_cookie returns either a dict with 'value' key or a string
+        cookie = (
+            result.get("value", result)
+            if isinstance(result, dict)
+            else str(result)
+        )
+        if cookie:
+            console.print("[green]Got d cookie from desktop app[/]")
+            return cookie
+    except Exception as exc:
+        logger.debug("Could not extract cookie from desktop app: %s", exc)
+
+    # Fall back to manual prompt
+    existing_cookie = config.get("cookie", "")
+    if existing_cookie:
+        console.print(
+            "[yellow]Could not auto-extract d cookie. "
+            "Press Enter to reuse stored cookie, or paste a new one.[/]"
+        )
+        console.print(
+            "[dim]Get it from: browser DevTools → Application "
+            "→ Cookies → app.slack.com → 'd'[/]"
+        )
+        return click.prompt(
+            "Paste d cookie value (xoxd-…)",
+            default=existing_cookie,
+            show_default=False,
+        )
+
+    console.print(
+        "[yellow]Get your d cookie from: browser DevTools → Application "
+        "→ Cookies → app.slack.com → 'd'[/]"
+    )
+    return click.prompt("Paste d cookie value (xoxd-…)")
+
+
+def _login_browser(config: dict) -> None:
+    """Import all workspaces from browser localStorage JSON.
+
+    The user pastes the output of:
+        JSON.stringify(JSON.parse(localStorage.localConfig_v2))
+    from browser DevTools. We extract every team's token from it.
+    """
+    # JS snippet that copies the result to clipboard automatically
+    js_snippet = (
+        "copy(JSON.stringify(JSON.parse(localStorage.localConfig_v2)))"
+    )
+    console.print(
+        "[yellow]Run this in your browser DevTools console:[/]"
+    )
+    console.print(f"[bold]{js_snippet}[/]")
+    click.prompt("Press Enter when copied", default="", show_default=False)
+
+    # Read directly from macOS clipboard to avoid terminal paste truncation
+    try:
+        result = subprocess.run(
+            ["pbpaste"], capture_output=True, text=True, check=True
+        )
+        raw = result.stdout
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        raise click.ClickException(
+            "Failed to read clipboard. Paste the JSON manually with "
+            "'pbpaste | slack_user_cli login --browser-stdin'"
+        ) from exc
+
+    if not raw.strip():
+        raise click.ClickException("Clipboard is empty.")
+
+    try:
+        local_config = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise click.ClickException(f"Invalid JSON: {exc}") from exc
+
+    teams = local_config.get("teams", {})
+    if not teams:
+        raise click.ClickException("No teams found in the pasted JSON.")
+
+    # Extract tokens keyed by team name
+    tokens: dict[str, str] = {}
+    for _team_id, team_data in teams.items():
+        name = team_data.get("name", team_data.get("team_name", _team_id))
+        token = team_data.get("token", "")
+        if token:
+            tokens[name] = token
+
+    if not tokens:
+        raise click.ClickException("No tokens found in the pasted JSON.")
+
+    # Try to auto-extract d cookie from the Slack desktop app first
+    cookie = _get_cookie_auto_or_prompt(config)
+    config["cookie"] = cookie
+
+    _validate_and_save_tokens(config, tokens, cookie)
+
+
+def _login_manual(config: dict, workspace_name: str | None) -> None:
+    """Login with a single manually-pasted token + cookie."""
+    token = click.prompt("Paste xoxc- token")
+    cookie = click.prompt("Paste d cookie value (xoxd-…)")
+    config["cookie"] = cookie
+
+    client = WebClient(token=token, headers={"cookie": f"d={cookie}"})
+    try:
+        resp = client.auth_test()
+    except SlackApiError as exc:
+        raise click.ClickException(
+            f"Auth validation failed: {exc.response['error']}"
+        ) from exc
+
+    team = workspace_name or resp.get("team", "default")
+    user = resp.get("user", "")
+    config["workspaces"][team] = {
+        "token": token,
+        "team": team,
+        "user": user,
+    }
+    if len(config["workspaces"]) == 1:
+        config["default"] = team
+
+    console.print(
+        f"[green]Logged in as [bold]{user}[/bold] "
+        f"in [bold]{team}[/bold][/]"
+    )
+
+
+def _validate_and_save_tokens(
+    config: dict, tokens: dict[str, str], cookie: str
+) -> None:
+    """Validate each token with auth.test and save to config.
+
+    If all tokens fail with invalid_auth, the d cookie is likely expired.
+    Prompts for a fresh cookie and retries once before giving up.
+    """
+    validated, cookie = _try_validate_tokens(config, tokens, cookie)
+
+    # All failed — likely an expired d cookie, retry with a fresh one
+    if not validated:
+        console.print(
+            "\n[yellow]All workspaces failed authentication. "
+            "The d cookie is likely expired.[/]"
+        )
+        console.print(
+            "[yellow]Get a fresh one: browser DevTools → Application "
+            "→ Cookies → app.slack.com → 'd'[/]"
+        )
+        cookie = click.prompt("Paste new d cookie value (xoxd-…)")
+        config["cookie"] = cookie
+        validated, cookie = _try_validate_tokens(config, tokens, cookie)
+
+    if not validated:
+        raise click.ClickException(
+            "No workspaces could be validated. Check your tokens and cookie."
+        )
+
+
+def _try_validate_tokens(
+    config: dict, tokens: dict[str, str], cookie: str
+) -> tuple[bool, str]:
+    """Attempt to validate all tokens against the Slack API.
+
+    Returns (any_succeeded, cookie) so the caller can retry if needed.
+    """
+    first_team = None
+    for ws_name, token in tokens.items():
+        client = WebClient(
+            token=token, headers={"cookie": f"d={cookie}"}
+        )
+        try:
+            resp = client.auth_test()
+        except SlackApiError as exc:
+            error = exc.response.get("error", str(exc))
+            console.print(
+                f"[red]Skipping {ws_name}: {error}[/]"
+            )
+            continue
+
+        team = resp.get("team", ws_name)
+        user = resp.get("user", "")
+        config["workspaces"][team] = {
+            "token": token,
+            "team": team,
+            "user": user,
+        }
+        if first_team is None:
+            first_team = team
+        console.print(
+            f"[green]Logged in as [bold]{user}[/bold] "
+            f"in [bold]{team}[/bold][/]"
+        )
+
+    # Set default to first workspace if not already set
+    if first_team and "default" not in config:
+        config["default"] = first_team
+
+    return (first_team is not None, cookie)
+
+
+# -- workspaces ---------------------------------------------------------------
+
+
+@cli.command()
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    default=False,
+    help="Emit structured JSON.",
+)
+def workspaces(as_json: bool) -> None:
+    """List all saved workspaces."""
+    config = load_config()
+    ws_map = config.get("workspaces", {})
+    default = config.get("default", "")
+
+    if not ws_map:
+        raise click.ClickException("No workspaces saved. Run 'login' first.")
+
+    if as_json:
+        out = [
+            {
+                "name": name,
+                "user": ws.get("user", ""),
+                "is_default": name == default,
+            }
+            for name, ws in ws_map.items()
+        ]
+        click.echo(
+            json.dumps(
+                {"default": default, "workspaces": out}, ensure_ascii=False
+            )
+        )
+        return
+
+    table = Table(title="Workspaces")
+    table.add_column("Name", style="cyan")
+    table.add_column("User")
+    table.add_column("Default")
+
+    for name, ws in ws_map.items():
+        is_default = "yes" if name == default else ""
+        table.add_row(name, ws.get("user", ""), is_default)
+
+    console.print(table)
+    console.print("[dim]Use -w <name> to switch workspace for a command.[/]")
+
+
+@cli.command()
+@click.argument("name")
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    default=False,
+    help="Emit structured JSON.",
+)
+def default(name: str, as_json: bool) -> None:
+    """Set the default workspace."""
+    config = load_config()
+    ws_map = config.get("workspaces", {})
+    if name not in ws_map:
+        available = ", ".join(ws_map.keys())
+        raise click.ClickException(
+            f"Workspace '{name}' not found. Available: {available}"
+        )
+    config["default"] = name
+    save_config(config)
+    if as_json:
+        click.echo(json.dumps({"ok": True, "default": name}, ensure_ascii=False))
+    else:
+        console.print(f"[green]Default workspace set to [bold]{name}[/bold][/]")
+
+
+@cli.command()
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    default=False,
+    help="Emit structured JSON.",
+)
+@click.pass_context
+def refresh(ctx: click.Context, as_json: bool) -> None:
+    """Force-refresh the channel and user cache for the active workspace."""
+    client = get_client(workspace=ctx.obj["workspace"])
+    ws = ctx.obj["workspace_name"]
+
+    if not as_json:
+        console.print(f"[yellow]Refreshing cache for {ws}…[/]")
+    ch_map = build_channel_cache(client, ws)
+    user_data = build_user_cache(client, ws)
+    user_count = len(user_data.get("id_to_display", {}))
+    if as_json:
+        click.echo(
+            json.dumps(
+                {
+                    "ok": True,
+                    "workspace": ws,
+                    "channels": len(ch_map),
+                    "users": user_count,
+                },
+                ensure_ascii=False,
+            )
+        )
+    else:
+        console.print(f"  Cached [bold]{len(ch_map)}[/] channels")
+        console.print(f"  Cached [bold]{user_count}[/] users")
+        console.print("[green]Cache refreshed.[/]")
+
+
+# -- channels -----------------------------------------------------------------
+
+
+@cli.command()
+@click.option(
+    "--type",
+    "channel_types",
+    default="public_channel,private_channel",
+    help="Comma-separated channel types to list.",
+)
+@click.option(
+    "--all",
+    "show_all",
+    is_flag=True,
+    default=False,
+    help="Show all visible channels, not just joined ones.",
+)
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    default=False,
+    help="Emit structured JSON.",
+)
+@click.option(
+    "--names",
+    "with_names",
+    is_flag=True,
+    default=False,
+    help="Show channel names in the primary column. Default shows raw IDs.",
+)
+@click.pass_context
+def channels(
+    ctx: click.Context,
+    channel_types: str,
+    show_all: bool,
+    as_json: bool,
+    with_names: bool,
+) -> None:
+    """List joined channels (use --all to include unjoined)."""
+    client = get_client(workspace=ctx.obj["workspace"])
+
+    collected: list[dict] = []
+    cursor = None
+    while True:
+        kwargs: dict = {"types": channel_types, "limit": 200}
+        if cursor:
+            kwargs["cursor"] = cursor
+        try:
+            resp = client.conversations_list(**kwargs)
+        except SlackApiError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+        for ch in resp["channels"]:
+            # Skip channels the user hasn't joined unless --all
+            if not show_all and not ch.get("is_member"):
+                continue
+            collected.append(ch)
+
+        cursor = resp.get("response_metadata", {}).get("next_cursor")
+        if not cursor:
+            break
+
+    if as_json:
+        out = [
+            {
+                "id": ch["id"],
+                "name": ch.get("name", ""),
+                "type": _channel_type_label(ch),
+                "num_members": ch.get("num_members", 0),
+                "topic": ch.get("topic", {}).get("value", ""),
+                "is_member": bool(ch.get("is_member")),
+            }
+            for ch in collected
+        ]
+        click.echo(json.dumps({"channels": out}, ensure_ascii=False))
+        return
+
+    table = Table(title="Channels")
+    table.add_column("ID" if not with_names else "Name", style="cyan")
+    table.add_column("Type", style="magenta")
+    table.add_column("Members", justify="right")
+    table.add_column("Topic")
+
+    for ch in collected:
+        ch_type = _channel_type_label(ch)
+        topic = ch.get("topic", {}).get("value", "")
+        if len(topic) > 60:
+            topic = topic[:57] + "…"
+        primary = ch.get("name", ch["id"]) if with_names else ch["id"]
+        table.add_row(
+            primary,
+            ch_type,
+            str(ch.get("num_members", "")),
+            topic,
+        )
+
+    console.print(table)
+
+
+def _channel_type_label(ch: dict) -> str:
+    """Derive a human-readable type label from channel metadata."""
+    if ch.get("is_im"):
+        return "DM"
+    if ch.get("is_mpim"):
+        return "Group DM"
+    if ch.get("is_private"):
+        return "Private"
+    return "Public"
+
+
+# -- read ---------------------------------------------------------------------
+
+
+@cli.command()
+@click.argument("channel")
+@click.option("--limit", default=20, help="Number of messages to show.")
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    default=False,
+    help="Emit structured JSON instead of human-readable output. "
+    "Intended for programmatic consumers (e.g. smithers workflows) that "
+    "would otherwise have to parse the rendered text back into fields.",
+)
+@click.option(
+    "--names",
+    "with_names",
+    is_flag=True,
+    default=False,
+    help="Resolve user IDs to display names (and rewrite <@UXXX> mentions). "
+    "Default emits raw IDs so output is stable for scripts.",
+)
+@click.option(
+    "--expand-thread",
+    is_flag=True,
+    default=False,
+    help="For every returned message that started a thread, also fetch its "
+    "replies and attach them inline under `replies`. Only meaningful with "
+    "--json. Decisions often live in replies rather than the parent post; "
+    "without this flag consumers only see parent messages.",
+)
+@click.pass_context
+def read(
+    ctx: click.Context,
+    channel: str,
+    limit: int,
+    as_json: bool,
+    with_names: bool,
+    expand_thread: bool,
+) -> None:
+    """Read recent messages from a channel."""
+    client = get_client(workspace=ctx.obj["workspace"])
+    ws = ctx.obj["workspace_name"]
+    channel_id = resolve_channel(client, channel, workspace=ws)
+
+    messages: list[dict] = []
+    cursor = None
+    while len(messages) < limit:
+        kwargs: dict = {
+            "channel": channel_id,
+            "limit": min(limit - len(messages), 200),
+        }
+        if cursor:
+            kwargs["cursor"] = cursor
+        try:
+            resp = client.conversations_history(**kwargs)
+        except SlackApiError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+        messages.extend(resp.get("messages", []))
+        cursor = resp.get("response_metadata", {}).get("next_cursor")
+        if not cursor:
+            break
+
+    # Messages come newest-first; reverse for chronological display
+    messages = messages[:limit]
+    messages.reverse()
+
+    # Expand threads *before* emitting. We stash replies on the message dict
+    # itself so _emit_messages_json can serialize them alongside the parent;
+    # the key is underscore-prefixed to avoid clashing with any Slack field.
+    if as_json and expand_thread:
+        for msg in messages:
+            ts = msg.get("ts", "")
+            if msg.get("thread_ts") and msg.get("reply_count", 0) and ts:
+                msg["_replies"] = _fetch_thread_replies(client, channel_id, ts)
+
+    if as_json:
+        _emit_messages_json(
+            client, channel, messages, workspace=ws, with_names=with_names
+        )
+    else:
+        _print_messages(client, messages, workspace=ws, with_names=with_names)
+
+
+def _fetch_thread_replies(
+    client: WebClient, channel_id: str, parent_ts: str, max_replies: int = 200
+) -> list[dict]:
+    """Fetch reply messages for a thread, excluding the parent itself.
+
+    `conversations.replies` always returns the parent as the first message;
+    we drop it because callers already have the parent from the top-level
+    history fetch. Errors are swallowed so one broken thread doesn't fail
+    the whole read — expansion is best-effort.
+    """
+    all_msgs: list[dict] = []
+    cursor = None
+    try:
+        while len(all_msgs) < max_replies + 1:  # +1 for the parent
+            kwargs: dict = {
+                "channel": channel_id,
+                "ts": parent_ts,
+                "limit": min(max_replies + 1 - len(all_msgs), 200),
+            }
+            if cursor:
+                kwargs["cursor"] = cursor
+            resp = client.conversations_replies(**kwargs)
+            all_msgs.extend(resp.get("messages", []))
+            cursor = resp.get("response_metadata", {}).get("next_cursor")
+            if not cursor:
+                break
+    except SlackApiError:
+        return []
+
+    # Drop the parent (index 0 when present); keep chronological order.
+    return [m for m in all_msgs if m.get("ts") != parent_ts][:max_replies]
+
+
+# -- thread -------------------------------------------------------------------
+
+
+@cli.command()
+@click.argument("channel")
+@click.argument("ts")
+@click.option("--limit", default=50, help="Number of replies to show.")
+@click.option("--dm", "is_dm", is_flag=True, default=False, help="Treat CHANNEL as a user name and resolve to DM channel.")
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    default=False,
+    help="Emit structured JSON.",
+)
+@click.option(
+    "--names",
+    "with_names",
+    is_flag=True,
+    default=False,
+    help="Resolve user IDs to display names. Default emits raw IDs.",
+)
+@click.pass_context
+def thread(
+    ctx: click.Context,
+    channel: str,
+    ts: str,
+    limit: int,
+    is_dm: bool,
+    as_json: bool,
+    with_names: bool,
+) -> None:
+    """Read thread replies for a given message timestamp."""
+    client = get_client(workspace=ctx.obj["workspace"])
+    ws = ctx.obj["workspace_name"]
+
+    if is_dm:
+        # Resolve user name to DM channel
+        user_id = channel
+        if not (channel.startswith("U") and channel[1:].isalnum()):
+            user_id = _resolve_user_by_name(client, channel, workspace=ws)
+        try:
+            resp = client.conversations_open(users=[user_id])
+        except SlackApiError as exc:
+            raise click.ClickException(str(exc)) from exc
+        channel_id = resp["channel"]["id"]
+    else:
+        channel_id = resolve_channel(client, channel, workspace=ws)
+
+    replies: list[dict] = []
+    cursor = None
+    while len(replies) < limit:
+        kwargs: dict = {
+            "channel": channel_id,
+            "ts": ts,
+            "limit": min(limit - len(replies), 200),
+        }
+        if cursor:
+            kwargs["cursor"] = cursor
+        try:
+            resp = client.conversations_replies(**kwargs)
+        except SlackApiError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+        replies.extend(resp.get("messages", []))
+        cursor = resp.get("response_metadata", {}).get("next_cursor")
+        if not cursor:
+            break
+
+    replies = replies[:limit]
+    if as_json:
+        _emit_messages_json(
+            client, channel, replies, workspace=ws, with_names=with_names
+        )
+    else:
+        _print_messages(client, replies, workspace=ws, with_names=with_names)
+
+
+# -- url (permalink reader) ---------------------------------------------------
+
+
+@cli.command(name="url")
+@click.argument("slack_url")
+@click.option("--limit", default=50, help="Number of messages to show.")
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    default=False,
+    help="Emit structured JSON.",
+)
+@click.option(
+    "--names",
+    "with_names",
+    is_flag=True,
+    default=False,
+    help="Resolve user IDs to display names. Default emits raw IDs.",
+)
+@click.pass_context
+def url_command(
+    ctx: click.Context,
+    slack_url: str,
+    limit: int,
+    as_json: bool,
+    with_names: bool,
+) -> None:
+    """Read a Slack thread from a permalink URL.
+
+    Parses a Slack permalink and fetches the thread (or surrounding context
+    for standalone messages). This lets agents read threads directly from
+    pasted URLs without manual channel/ts extraction.
+    """
+    _workspace, channel_id, message_ts = parse_slack_url(slack_url)
+    client = get_client(workspace=ctx.obj["workspace"])
+    ws = ctx.obj["workspace_name"]
+
+    # Try fetching as a thread first
+    replies: list[dict] = []
+    cursor = None
+    while len(replies) < limit:
+        kwargs: dict = {
+            "channel": channel_id,
+            "ts": message_ts,
+            "limit": min(limit - len(replies), 200),
+        }
+        if cursor:
+            kwargs["cursor"] = cursor
+        try:
+            resp = client.conversations_replies(**kwargs)
+        except SlackApiError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+        replies.extend(resp.get("messages", []))
+        cursor = resp.get("response_metadata", {}).get("next_cursor")
+        if not cursor:
+            break
+
+    replies = replies[:limit]
+    if as_json:
+        _emit_messages_json(
+            client, slack_url, replies, workspace=ws, with_names=with_names
+        )
+    else:
+        _print_messages(client, replies, workspace=ws, with_names=with_names)
+
+
+# -- users --------------------------------------------------------------------
+
+
+@cli.command()
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    default=False,
+    help="Emit structured JSON.",
+)
+@click.option(
+    "--names",
+    "with_names",
+    is_flag=True,
+    default=False,
+    help="Show display names in the primary column. Default shows raw IDs.",
+)
+@click.pass_context
+def users(ctx: click.Context, as_json: bool, with_names: bool) -> None:
+    """List workspace members."""
+    client = get_client(workspace=ctx.obj["workspace"])
+
+    members: list[dict] = []
+    cursor = None
+    while True:
+        kwargs: dict = {"limit": 200}
+        if cursor:
+            kwargs["cursor"] = cursor
+        try:
+            resp = client.users_list(**kwargs)
+        except SlackApiError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+        for member in resp["members"]:
+            # Skip bots and deactivated users for cleaner output
+            if member.get("is_bot") or member.get("deleted"):
+                continue
+            members.append(member)
+
+        cursor = resp.get("response_metadata", {}).get("next_cursor")
+        if not cursor:
+            break
+
+    if as_json:
+        out = []
+        for member in members:
+            profile = member.get("profile", {})
+            out.append({
+                "id": member.get("id", ""),
+                "name": member.get("name", ""),
+                "display_name": profile.get("display_name", ""),
+                "real_name": profile.get("real_name", ""),
+                "status_emoji": profile.get("status_emoji", ""),
+                "status_text": profile.get("status_text", ""),
+            })
+        click.echo(json.dumps({"users": out}, ensure_ascii=False))
+        return
+
+    table = Table(title="Users")
+    table.add_column("ID" if not with_names else "Display Name", style="cyan")
+    table.add_column("Username")
+    table.add_column("Real Name")
+    table.add_column("Status")
+
+    for member in members:
+        profile = member.get("profile", {})
+        primary = (
+            (profile.get("display_name") or member.get("name", ""))
+            if with_names
+            else member.get("id", "")
+        )
+        username = member.get("name", "")
+        real = profile.get("real_name", "")
+        status_emoji = profile.get("status_emoji", "")
+        status_text = profile.get("status_text", "")
+        status = f"{status_emoji} {status_text}".strip()
+        table.add_row(primary, username, real, status)
+
+    console.print(table)
+
+
+# -- user-channels ------------------------------------------------------------
+
+
+@cli.command(name="user-channels")
+@click.argument("user")
+@click.option(
+    "--type",
+    "channel_types",
+    default="public_channel,private_channel",
+    help="Comma-separated channel types to list.",
+)
+@click.option(
+    "--plain",
+    is_flag=True,
+    default=False,
+    help="Output one channel ID (or name with --names) per line.",
+)
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    default=False,
+    help="Emit structured JSON.",
+)
+@click.option(
+    "--names",
+    "with_names",
+    is_flag=True,
+    default=False,
+    help="Show channel names (and resolve the user header). Default shows raw IDs.",
+)
+@click.pass_context
+def user_channels(
+    ctx: click.Context,
+    user: str,
+    channel_types: str,
+    plain: bool,
+    as_json: bool,
+    with_names: bool,
+) -> None:
+    """List channels a user is a member of."""
+    client = get_client(workspace=ctx.obj["workspace"])
+    ws = ctx.obj["workspace_name"]
+
+    # Resolve user name to ID if needed
+    user_id = user
+    if not (user.startswith("U") and user[1:].isalnum()):
+        user_id = _resolve_user_by_name(client, user, workspace=ws)
+
+    # Collect all channels first so both formats can use the same data
+    channels_list: list[dict] = []
+    cursor = None
+    while True:
+        kwargs: dict = {"user": user_id, "types": channel_types, "limit": 200}
+        if cursor:
+            kwargs["cursor"] = cursor
+        try:
+            resp = client.users_conversations(**kwargs)
+        except SlackApiError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+        channels_list.extend(resp["channels"])
+        cursor = resp.get("response_metadata", {}).get("next_cursor")
+        if not cursor:
+            break
+
+    if as_json:
+        out = [
+            {
+                "id": ch["id"],
+                "name": ch.get("name", ""),
+                "type": _channel_type_label(ch),
+                "num_members": ch.get("num_members", 0),
+                "topic": ch.get("topic", {}).get("value", ""),
+            }
+            for ch in channels_list
+        ]
+        click.echo(
+            json.dumps({"user": user_id, "channels": out}, ensure_ascii=False)
+        )
+        return
+
+    if plain:
+        for ch in channels_list:
+            click.echo(ch.get("name", ch["id"]) if with_names else ch["id"])
+        return
+
+    header = (
+        resolve_user(client, user_id, workspace=ws) if with_names else user_id
+    )
+    table = Table(title=f"Channels for {header}")
+    table.add_column("ID" if not with_names else "Name", style="cyan")
+    table.add_column("Type", style="magenta")
+    table.add_column("Members", justify="right")
+    table.add_column("Topic")
+
+    for ch in channels_list:
+        ch_type = _channel_type_label(ch)
+        topic = ch.get("topic", {}).get("value", "")
+        if len(topic) > 60:
+            topic = topic[:57] + "…"
+        primary = ch.get("name", ch["id"]) if with_names else ch["id"]
+        table.add_row(
+            primary,
+            ch_type,
+            str(ch.get("num_members", "")),
+            topic,
+        )
+
+    console.print(table)
+
+
+# -- send ---------------------------------------------------------------------
+
+
+@cli.command()
+@click.argument("channel")
+@click.argument("message")
+@click.option("--thread", "thread_ts", default=None, help="Reply in thread (message timestamp).")
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    default=False,
+    help="Emit structured JSON.",
+)
+@click.pass_context
+def send(
+    ctx: click.Context,
+    channel: str,
+    message: str,
+    thread_ts: str | None,
+    as_json: bool,
+) -> None:
+    """Send a message to a channel. Use --thread to reply in a thread."""
+    client = get_client(workspace=ctx.obj["workspace"])
+    ws = ctx.obj["workspace_name"]
+    channel_id = resolve_channel(client, channel, workspace=ws)
+
+    kwargs: dict = {"channel": channel_id, "text": message}
+    if thread_ts:
+        kwargs["thread_ts"] = thread_ts
+
+    try:
+        resp = client.chat_postMessage(**kwargs)
+    except SlackApiError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    ts = resp.get("ts", "")
+    if as_json:
+        click.echo(
+            json.dumps(
+                {"ok": True, "channel": channel_id, "ts": ts}, ensure_ascii=False
+            )
+        )
+    else:
+        console.print(f"[green]Message sent[/] (ts={ts})")
+
+
+# -- upload -------------------------------------------------------------------
+
+
+@cli.command()
+@click.argument("channel")
+@click.argument("file_path", type=click.Path(exists=True))
+@click.option("--thread", "thread_ts", default=None, help="Upload in thread.")
+@click.option("--message", "initial_comment", default=None, help="Message to accompany the file.")
+@click.option("--title", default=None, help="File title (defaults to filename).")
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    default=False,
+    help="Emit structured JSON.",
+)
+@click.pass_context
+def upload(
+    ctx: click.Context,
+    channel: str,
+    file_path: str,
+    thread_ts: str | None,
+    initial_comment: str | None,
+    title: str | None,
+    as_json: bool,
+) -> None:
+    """Upload a file to a channel."""
+    client = get_client(workspace=ctx.obj["workspace"])
+    ws = ctx.obj["workspace_name"]
+    channel_id = resolve_channel(client, channel, workspace=ws)
+
+    kwargs: dict = {"channel": channel_id, "file": file_path}
+    if thread_ts:
+        kwargs["thread_ts"] = thread_ts
+    if initial_comment:
+        kwargs["initial_comment"] = initial_comment
+    if title:
+        kwargs["title"] = title
+
+    try:
+        resp = client.files_upload_v2(**kwargs)
+    except SlackApiError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    file_id = resp.get("file", {}).get("id", "unknown")
+    if as_json:
+        click.echo(
+            json.dumps(
+                {"ok": True, "channel": channel_id, "file_id": file_id},
+                ensure_ascii=False,
+            )
+        )
+    else:
+        console.print(f"[green]File uploaded[/] (id={file_id})")
+
+
+# -- dm -----------------------------------------------------------------------
+
+
+@cli.command()
+@click.argument("user")
+@click.argument("message", required=False, default=None)
+@click.option("--limit", default=20, help="Messages to show when reading.")
+@click.option("--thread", "thread_ts", default=None, help="Reply in thread (message timestamp).")
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    default=False,
+    help="Emit structured JSON.",
+)
+@click.option(
+    "--names",
+    "with_names",
+    is_flag=True,
+    default=False,
+    help="Resolve user IDs to display names when reading. Default emits raw IDs.",
+)
+@click.pass_context
+def dm(
+    ctx: click.Context,
+    user: str,
+    message: str | None,
+    limit: int,
+    thread_ts: str | None,
+    as_json: bool,
+    with_names: bool,
+) -> None:
+    """Open a DM with a user. Send a message or read recent history."""
+    client = get_client(workspace=ctx.obj["workspace"])
+    ws = ctx.obj["workspace_name"]
+
+    # Resolve user name to ID if needed (simple heuristic: IDs start with U)
+    user_id = user
+    if not (user.startswith("U") and user[1:].isalnum()):
+        user_id = _resolve_user_by_name(client, user, workspace=ws)
+
+    # Open (or retrieve) the DM channel
+    try:
+        resp = client.conversations_open(users=[user_id])
+    except SlackApiError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    dm_channel = resp["channel"]["id"]
+
+    if message:
+        kwargs: dict = {"channel": dm_channel, "text": message}
+        if thread_ts:
+            kwargs["thread_ts"] = thread_ts
+        try:
+            send_resp = client.chat_postMessage(**kwargs)
+        except SlackApiError as exc:
+            raise click.ClickException(str(exc)) from exc
+        ts = send_resp.get("ts", "")
+        if as_json:
+            click.echo(
+                json.dumps(
+                    {"ok": True, "channel": dm_channel, "ts": ts},
+                    ensure_ascii=False,
+                )
+            )
+        else:
+            label = "DM thread reply sent" if thread_ts else "DM sent"
+            console.print(f"[green]{label}[/] (ts={ts})")
+    else:
+        # Read recent DM history
+        try:
+            hist = client.conversations_history(
+                channel=dm_channel, limit=limit
+            )
+        except SlackApiError as exc:
+            raise click.ClickException(str(exc)) from exc
+        messages = list(reversed(hist.get("messages", [])))
+        if as_json:
+            _emit_messages_json(
+                client, dm_channel, messages, workspace=ws, with_names=with_names
+            )
+        else:
+            _print_messages(client, messages, workspace=ws, with_names=with_names)
+
+
+# -- dm-upload ----------------------------------------------------------------
+
+
+@cli.command(name="dm-upload")
+@click.argument("user")
+@click.argument("file_path", type=click.Path(exists=True))
+@click.option("--thread", "thread_ts", default=None, help="Upload in thread.")
+@click.option("--message", "initial_comment", default=None, help="Message to accompany the file.")
+@click.option("--title", default=None, help="File title (defaults to filename).")
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    default=False,
+    help="Emit structured JSON.",
+)
+@click.pass_context
+def dm_upload(
+    ctx: click.Context,
+    user: str,
+    file_path: str,
+    thread_ts: str | None,
+    initial_comment: str | None,
+    title: str | None,
+    as_json: bool,
+) -> None:
+    """Upload a file to a user via DM."""
+    client = get_client(workspace=ctx.obj["workspace"])
+    ws = ctx.obj["workspace_name"]
+
+    # Resolve user name to ID if needed (IDs start with U)
+    user_id = user
+    if not (user.startswith("U") and user[1:].isalnum()):
+        user_id = _resolve_user_by_name(client, user, workspace=ws)
+
+    # Open (or retrieve) the DM channel
+    try:
+        resp = client.conversations_open(users=[user_id])
+    except SlackApiError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    dm_channel = resp["channel"]["id"]
+
+    kwargs: dict = {"channel": dm_channel, "file": file_path}
+    if thread_ts:
+        kwargs["thread_ts"] = thread_ts
+    if initial_comment:
+        kwargs["initial_comment"] = initial_comment
+    if title:
+        kwargs["title"] = title
+
+    try:
+        upload_resp = client.files_upload_v2(**kwargs)
+    except SlackApiError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    file_id = upload_resp.get("file", {}).get("id", "unknown")
+    if as_json:
+        click.echo(
+            json.dumps(
+                {"ok": True, "channel": dm_channel, "file_id": file_id},
+                ensure_ascii=False,
+            )
+        )
+    else:
+        console.print(f"[green]File uploaded via DM[/] (id={file_id})")
+
+
+def _resolve_user_by_name(
+    client: WebClient, name: str, workspace: str = ""
+) -> str:
+    """Resolve a user by username or display_name, using disk cache."""
+    if workspace:
+        user_data = _get_user_cache(client, workspace)
+        # Check username first, then display name
+        uid = user_data.get("name_to_id", {}).get(name)
+        if uid:
+            return uid
+        uid = user_data.get("display_to_id", {}).get(name)
+        if uid:
+            return uid
+
+    # Cache miss — fall back to paginating the API
+    cursor = None
+    while True:
+        kwargs: dict = {"limit": 200}
+        if cursor:
+            kwargs["cursor"] = cursor
+        resp = client.users_list(**kwargs)
+        for member in resp["members"]:
+            if member.get("name") == name:
+                return member["id"]
+            profile = member.get("profile", {})
+            if profile.get("display_name") == name:
+                return member["id"]
+        cursor = resp.get("response_metadata", {}).get("next_cursor")
+        if not cursor:
+            break
+    raise click.ClickException(f"User '{name}' not found.")
+
+
+# -- search -------------------------------------------------------------------
+
+
+@cli.command()
+@click.argument("query")
+@click.option("--count", default=20, help="Results per page.")
+@click.option("--page", default=1, help="Page number.")
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    default=False,
+    help="Emit structured JSON.",
+)
+@click.option(
+    "--names",
+    "with_names",
+    is_flag=True,
+    default=False,
+    help="Show usernames and channel names. Default shows raw user/channel IDs.",
+)
+@click.pass_context
+def search(
+    ctx: click.Context,
+    query: str,
+    count: int,
+    page: int,
+    as_json: bool,
+    with_names: bool,
+) -> None:
+    """Search messages across the workspace."""
+    client = get_client(workspace=ctx.obj["workspace"])
+
+    try:
+        # search.messages uses page-based pagination (not cursor)
+        resp = client.search_messages(query=query, count=count, page=page)
+    except SlackApiError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    matches = resp.get("messages", {})
+    total = matches.get("total", 0)
+    paging = matches.get("paging", {})
+    raw_matches = matches.get("matches", [])
+
+    if as_json:
+        out = []
+        for match in raw_matches:
+            channel = match.get("channel", {}) or {}
+            if with_names:
+                user_field = match.get("username", "")
+                channel_field = channel.get("name", "")
+            else:
+                user_field = match.get("user", "")
+                channel_field = channel.get("id", "")
+            out.append({
+                "ts": _format_ts(match.get("ts", "")),
+                "user": user_field,
+                "channel": channel_field,
+                "text": match.get("text", ""),
+                "permalink": match.get("permalink", ""),
+            })
+        click.echo(
+            json.dumps(
+                {
+                    "query": query,
+                    "page": paging.get("page", page),
+                    "pages": paging.get("pages", 1),
+                    "total": total,
+                    "matches": out,
+                },
+                ensure_ascii=False,
+            )
+        )
+        return
+
+    console.print(
+        f"[bold]Search results for '{query}'[/] "
+        f"— page {paging.get('page', page)}/{paging.get('pages', 1)}, "
+        f"{total} total matches"
+    )
+
+    for match in raw_matches:
+        channel = match.get("channel", {}) or {}
+        if with_names:
+            user_field = match.get("username", "unknown")
+            channel_field = f"#{channel.get('name', '?')}"
+        else:
+            user_field = match.get("user", "?")
+            channel_field = channel.get("id", "?")
+        text = match.get("text", "")
+        ts = match.get("ts", "")
+        ts_display = _format_ts(ts)
+
+        line = Text()
+        line.append(f"[{ts_display}] ", style="dim")
+        line.append(f"{channel_field} ", style="blue")
+        line.append(f"{user_field}: ", style="bold")
+        line.append(text)
+        console.print(line)
+
+
+# -- canvas -------------------------------------------------------------------
+
+
+@cli.command()
+@click.argument("canvas_url_or_id")
+@click.option("--html", "raw_html", is_flag=True, default=False, help="Output raw HTML instead of plain text.")
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    default=False,
+    help="Emit structured JSON.",
+)
+@click.pass_context
+def canvas(
+    ctx: click.Context,
+    canvas_url_or_id: str,
+    raw_html: bool,
+    as_json: bool,
+) -> None:
+    """Read a Slack canvas by URL or file ID."""
+    client = get_client(workspace=ctx.obj["workspace"])
+
+    # Accept both full URLs and bare file IDs
+    if canvas_url_or_id.startswith("http"):
+        file_id = parse_canvas_url(canvas_url_or_id)
+    else:
+        file_id = canvas_url_or_id
+
+    title, html_content = _fetch_canvas_content(client, file_id)
+
+    if as_json:
+        payload: dict = {"file_id": file_id, "title": title}
+        if raw_html:
+            payload["html"] = html_content
+        else:
+            payload["text"] = _html_to_text(html_content)
+        click.echo(json.dumps(payload, ensure_ascii=False))
+        return
+
+    if raw_html:
+        console.print(f"[bold]{title}[/]\n")
+        click.echo(html_content)
+    else:
+        text = _html_to_text(html_content)
+        console.print(f"[bold]{title}[/]\n")
+        console.print(text)
+
+
+@cli.command("canvas-edit")
+@click.argument("canvas_url_or_id")
+@click.argument("content", required=False)
+@click.option(
+    "--operation",
+    type=click.Choice(
+        ["insert_at_end", "insert_at_start", "replace"],
+        case_sensitive=False,
+    ),
+    default="insert_at_end",
+    help="Edit operation (default: insert_at_end).",
+)
+@click.option(
+    "--section-id",
+    default=None,
+    help="Section ID for targeted replace/insert operations.",
+)
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    default=False,
+    help="Emit structured JSON.",
+)
+@click.pass_context
+def canvas_edit(
+    ctx: click.Context,
+    canvas_url_or_id: str,
+    content: str | None,
+    operation: str,
+    section_id: str | None,
+    as_json: bool,
+) -> None:
+    """Edit a Slack canvas by URL or file ID.
+
+    Content can be passed as an argument or piped via stdin.
+    Accepts markdown — Slack converts it to canvas formatting.
+
+    Examples:
+
+        # Append markdown to a canvas
+        slack_user_cli canvas-edit DEADBEEFUUV "## New Section\\nSome text"
+
+        # Replace entire canvas content
+        slack_user_cli canvas-edit DEADBEEFUUV "## Fresh Start" --operation replace
+
+        # Pipe content from a file
+        cat summary.md | slack_user_cli canvas-edit DEADBEEFUUV --operation replace
+    """
+    import sys  # noqa: PLC0415
+
+    client = get_client(workspace=ctx.obj["workspace"])
+
+    # Accept both full URLs and bare file IDs.
+    if canvas_url_or_id.startswith("http"):
+        file_id = parse_canvas_url(canvas_url_or_id)
+    else:
+        file_id = canvas_url_or_id
+
+    # Read content from argument or stdin.
+    if content is None:
+        if sys.stdin.isatty():
+            raise click.ClickException(
+                "No content provided. Pass as argument or pipe via stdin."
+            )
+        content = sys.stdin.read()
+
+    if not content.strip():
+        raise click.ClickException("Content is empty — nothing to write.")
+
+    change: dict = {
+        "operation": operation,
+        "document_content": {"type": "markdown", "markdown": content},
+    }
+    if section_id is not None:
+        change["section_id"] = section_id
+
+    try:
+        resp = client.api_call(
+            "canvases.edit",
+            json={"canvas_id": file_id, "changes": [change]},
+        )
+    except SlackApiError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if not resp.get("ok"):
+        error = resp.get("error", "unknown_error")
+        detail = resp.get("detail", "")
+        raise click.ClickException(f"canvases.edit failed: {error} — {detail}")
+
+    if as_json:
+        click.echo(
+            json.dumps(
+                {"ok": True, "file_id": file_id, "operation": operation},
+                ensure_ascii=False,
+            )
+        )
+    else:
+        console.print(f"[green]Canvas {file_id} updated ({operation}).[/]")
+
+
+# -- Output helpers -----------------------------------------------------------
+
+
+def _format_ts(ts: str) -> str:
+    """Convert a Slack timestamp to a human-readable datetime string."""
+    try:
+        from datetime import datetime, timezone  # noqa: PLC0415
+
+        epoch = float(ts.split(".")[0])
+        dt = datetime.fromtimestamp(epoch, tz=timezone.utc)
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except (ValueError, IndexError):
+        return ts
+
+
+def _print_messages(
+    client: WebClient,
+    messages: list[dict],
+    workspace: str = "",
+    with_names: bool = False,
+) -> None:
+    """Render a list of Slack messages to the console.
+
+    Default shows raw user IDs (and leaves <@UXXX> mention tokens untouched)
+    so output is stable for scripts. Pass `with_names=True` to resolve to
+    display names.
+    """
+    for msg in messages:
+        user_id = msg.get("user", "")
+        if with_names:
+            username = (
+                resolve_user(client, user_id, workspace=workspace)
+                if user_id
+                else "bot"
+            )
+            text = _resolve_mentions(client, msg.get("text", ""), workspace=workspace)
+        else:
+            username = user_id or "bot"
+            text = msg.get("text", "")
+        ts = msg.get("ts", "")
+        ts_display = _format_ts(ts)
+        thread_ts = msg.get("thread_ts")
+        reply_count = msg.get("reply_count", 0)
+
+        line = Text()
+        line.append(f"[{ts_display}] ", style="dim")
+        line.append(f"{username}: ", style="bold")
+        line.append(text)
+        # Indicate threaded messages
+        if thread_ts and reply_count:
+            line.append(f" [{reply_count} replies]", style="yellow")
+        console.print(line)
+
+
+# Matches Slack user-mention tokens. Slack emits either `<@U0123>` when the
+# display name is omitted or `<@U0123|name>` when it's already known; both
+# shapes need to become a @displayname so JSON consumers don't see raw IDs.
+_USER_MENTION_RE = re.compile(r"<@(?P<id>[UW][A-Z0-9]+)(?:\|[^>]+)?>")
+
+
+def _resolve_mentions(
+    client: WebClient, text: str, workspace: str = ""
+) -> str:
+    """Replace <@UXXX> user mentions with @displayname.
+
+    Slack's own text payload contains IDs rather than names inside mention
+    tokens; `resolve_user` is hit per ID but its cache makes that cheap —
+    repeated mentions of the same person become O(1) after the first lookup.
+    Other Slack mrkdwn tokens (<#C.../name>, <https://...|label>) are left
+    alone for now because they already carry a human-readable label.
+    """
+    if not text or "<@" not in text:
+        return text
+
+    def sub(match: re.Match[str]) -> str:
+        name = resolve_user(client, match.group("id"), workspace=workspace)
+        return f"@{name}"
+
+    return _USER_MENTION_RE.sub(sub, text)
+
+
+def _message_to_entry(
+    client: WebClient,
+    msg: dict,
+    workspace: str,
+    with_names: bool,
+) -> dict:
+    """Build the JSON entry for a single message.
+
+    By default emits raw user IDs and untouched text so consumers see stable
+    Slack identifiers. With `with_names=True`, user IDs become display names
+    and `<@UXXX>` mention tokens are rewritten to `@displayname`.
+    """
+    user_id = msg.get("user", "")
+    if with_names:
+        username = (
+            resolve_user(client, user_id, workspace=workspace) if user_id else "bot"
+        )
+        text = _resolve_mentions(client, msg.get("text", ""), workspace=workspace)
+    else:
+        username = user_id or "bot"
+        text = msg.get("text", "")
+
+    entry: dict = {
+        "ts": _format_ts(msg.get("ts", "")),
+        "user": username,
+        "text": text,
+    }
+    reply_count = msg.get("reply_count", 0)
+    if msg.get("thread_ts") and reply_count:
+        entry["threadCount"] = reply_count
+    replies = msg.get("_replies") or []
+    if replies:
+        entry["replies"] = [
+            _message_to_entry(client, r, workspace, with_names) for r in replies
+        ]
+    return entry
+
+
+def _emit_messages_json(
+    client: WebClient,
+    channel: str,
+    messages: list[dict],
+    workspace: str = "",
+    with_names: bool = False,
+) -> None:
+    """Emit messages as a single JSON object on stdout."""
+    parsed = [_message_to_entry(client, m, workspace, with_names) for m in messages]
+    click.echo(
+        json.dumps({"channel": channel, "messages": parsed}, ensure_ascii=False)
+    )
+
+
+if __name__ == "__main__":
+    cli()
