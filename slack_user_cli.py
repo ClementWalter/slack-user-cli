@@ -17,6 +17,7 @@ or browser DevTools. No Slack app registration needed.
 
 import json
 import logging
+import subprocess
 from pathlib import Path
 
 import click
@@ -294,12 +295,25 @@ def _login_browser(config: dict) -> None:
         "copy(JSON.stringify(JSON.parse(localStorage.localConfig_v2)))"
     )
     console.print(
-        "[yellow]Run this in your browser DevTools console "
-        "(result is copied to clipboard):[/]"
+        "[yellow]Run this in your browser DevTools console:[/]"
     )
     console.print(f"[bold]{js_snippet}[/]")
-    console.print("[dim]Then paste here (Cmd+V):[/]")
-    raw = click.prompt("Paste JSON")
+    click.prompt("Press Enter when copied", default="", show_default=False)
+
+    # Read directly from macOS clipboard to avoid terminal paste truncation
+    try:
+        result = subprocess.run(
+            ["pbpaste"], capture_output=True, text=True, check=True
+        )
+        raw = result.stdout
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        raise click.ClickException(
+            "Failed to read clipboard. Paste the JSON manually with "
+            "'pbpaste | slack_user_cli login --browser-stdin'"
+        ) from exc
+
+    if not raw.strip():
+        raise click.ClickException("Clipboard is empty.")
 
     try:
         local_config = json.loads(raw)
