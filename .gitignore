@@ -17,3 +17,4 @@ __pycache__/
 .codex/skills
 CLAUDE.md
 AGENTS.md
+.claude/cache
