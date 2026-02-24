@@ -289,12 +289,16 @@ def _login_browser(config: dict) -> None:
         JSON.stringify(JSON.parse(localStorage.localConfig_v2))
     from browser DevTools. We extract every team's token from it.
     """
-    console.print(
-        "[yellow]Paste the output of this from your browser DevTools console:[/]"
+    # JS snippet that copies the result to clipboard automatically
+    js_snippet = (
+        "copy(JSON.stringify(JSON.parse(localStorage.localConfig_v2)))"
     )
     console.print(
-        '[bold]JSON.stringify(JSON.parse(localStorage.localConfig_v2))[/]'
+        "[yellow]Run this in your browser DevTools console "
+        "(result is copied to clipboard):[/]"
     )
+    console.print(f"[bold]{js_snippet}[/]")
+    console.print("[dim]Then paste here (Cmd+V):[/]")
     raw = click.prompt("Paste JSON")
 
     try:
