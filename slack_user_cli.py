@@ -203,7 +203,13 @@ def cli(ctx: click.Context, debug: bool, workspace: str | None) -> None:
     "--manual",
     "mode",
     flag_value="manual",
-    help="Paste credentials from browser DevTools.",
+    help="Paste credentials from browser DevTools (one workspace).",
+)
+@click.option(
+    "--browser",
+    "mode",
+    flag_value="browser",
+    help="Paste localStorage JSON from browser to import all workspaces.",
 )
 @click.option(
     "--workspace-name",
@@ -213,8 +219,10 @@ def cli(ctx: click.Context, debug: bool, workspace: str | None) -> None:
 def login(mode: str | None, workspace_name: str | None) -> None:
     """Authenticate with Slack using session credentials.
 
-    In auto mode, all workspaces from the Slack desktop app are saved.
-    In manual mode, a single workspace is added.
+    Three modes:
+      --auto     Extract from Slack desktop app (all workspaces).
+      --browser  Paste browser localStorage JSON (all workspaces).
+      --manual   Paste a single xoxc- token + d cookie.
     """
     if mode is None:
         mode = "auto"
@@ -223,95 +231,11 @@ def login(mode: str | None, workspace_name: str | None) -> None:
     config.setdefault("workspaces", {})
 
     if mode == "auto":
-        try:
-            # slacktokens extracts from Slack desktop's LevelDB + macOS Keychain
-            from slacktokens import get_tokens_and_cookie  # noqa: PLC0415
-        except ImportError as exc:
-            raise click.ClickException(
-                "slacktokens not available. Use --manual instead."
-            ) from exc
-
-        console.print(
-            "[yellow]Extracting credentials from Slack desktop app…[/]"
-        )
-        console.print(
-            "[dim]Note: close Slack desktop first (LevelDB lock) "
-            "and allow Keychain access when prompted.[/]"
-        )
-        result = get_tokens_and_cookie()
-        cookie = result.get("cookie", "")
-        config["cookie"] = cookie
-
-        # slacktokens returns {cookie: str, tokens: {workspace: token, ...}}
-        tokens = result.get("tokens", {})
-        if not tokens:
-            raise click.ClickException(
-                "No tokens found. Is Slack desktop installed and logged in?"
-            )
-
-        # Validate and save every workspace
-        first_team = None
-        for ws_name, token in tokens.items():
-            client = WebClient(
-                token=token, headers={"cookie": f"d={cookie}"}
-            )
-            try:
-                resp = client.auth_test()
-            except SlackApiError:
-                console.print(
-                    f"[red]Skipping {ws_name}: auth validation failed[/]"
-                )
-                continue
-
-            team = resp.get("team", ws_name)
-            user = resp.get("user", "")
-            config["workspaces"][team] = {
-                "token": token,
-                "team": team,
-                "user": user,
-            }
-            if first_team is None:
-                first_team = team
-            console.print(
-                f"[green]Logged in as [bold]{user}[/bold] "
-                f"in [bold]{team}[/bold][/]"
-            )
-
-        # Set default to first workspace if not already set
-        if "default" not in config and first_team:
-            config["default"] = first_team
-
+        _login_auto(config)
+    elif mode == "browser":
+        _login_browser(config)
     else:
-        token = click.prompt("Paste xoxc- token")
-        cookie = click.prompt("Paste d cookie value (xoxd-…)")
-        config["cookie"] = cookie
-
-        # Validate before saving
-        client = WebClient(
-            token=token, headers={"cookie": f"d={cookie}"}
-        )
-        try:
-            resp = client.auth_test()
-        except SlackApiError as exc:
-            raise click.ClickException(
-                f"Auth validation failed: {exc.response['error']}"
-            ) from exc
-
-        team = workspace_name or resp.get("team", "default")
-        user = resp.get("user", "")
-        config["workspaces"][team] = {
-            "token": token,
-            "team": team,
-            "user": user,
-        }
-        # Set as default if it's the only workspace
-        if len(config["workspaces"]) == 1:
-            config["default"] = team
-
-        console.print(
-            f"[green]Logged in as [bold]{user}[/bold] "
-            f"in [bold]{team}[/bold][/]"
-        )
+        _login_manual(config, workspace_name)
 
     save_config(config)
 
@@ -319,8 +243,156 @@ def login(mode: str | None, workspace_name: str | None) -> None:
     ws_count = len(config.get("workspaces", {}))
     default = config.get("default", "")
     if ws_count > 1:
-        console.print(f"\n[bold]{ws_count} workspaces saved.[/] Default: [cyan]{default}[/]")
-        console.print("[dim]Use -w <name> to switch, or 'workspaces' to list all.[/]")
+        console.print(
+            f"\n[bold]{ws_count} workspaces saved.[/] "
+            f"Default: [cyan]{default}[/]"
+        )
+        console.print(
+            "[dim]Use -w <name> to switch, or 'workspaces' to list all.[/]"
+        )
+
+
+def _login_auto(config: dict) -> None:
+    """Extract credentials from Slack desktop app via slacktokens."""
+    try:
+        from slacktokens import get_tokens_and_cookie  # noqa: PLC0415
+    except ImportError as exc:
+        raise click.ClickException(
+            "slacktokens not available. Use --manual or --browser instead."
+        ) from exc
+
+    console.print(
+        "[yellow]Extracting credentials from Slack desktop app…[/]"
+    )
+    console.print(
+        "[dim]Note: close Slack desktop first (LevelDB lock) "
+        "and allow Keychain access when prompted.[/]"
+    )
+    result = get_tokens_and_cookie()
+    cookie = result.get("cookie", "")
+    config["cookie"] = cookie
+
+    # slacktokens returns {cookie: str, tokens: {workspace: token, ...}}
+    tokens = result.get("tokens", {})
+    if not tokens:
+        raise click.ClickException(
+            "No tokens found. Is Slack desktop installed and logged in?"
+        )
+
+    _validate_and_save_tokens(config, tokens, cookie)
+
+
+def _login_browser(config: dict) -> None:
+    """Import all workspaces from browser localStorage JSON.
+
+    The user pastes the output of:
+        JSON.stringify(JSON.parse(localStorage.localConfig_v2))
+    from browser DevTools. We extract every team's token from it.
+    """
+    console.print(
+        "[yellow]Paste the output of this from your browser DevTools console:[/]"
+    )
+    console.print(
+        '[bold]JSON.stringify(JSON.parse(localStorage.localConfig_v2))[/]'
+    )
+    raw = click.prompt("Paste JSON")
+
+    try:
+        local_config = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise click.ClickException(f"Invalid JSON: {exc}") from exc
+
+    teams = local_config.get("teams", {})
+    if not teams:
+        raise click.ClickException("No teams found in the pasted JSON.")
+
+    # Extract tokens keyed by team name
+    tokens: dict[str, str] = {}
+    for _team_id, team_data in teams.items():
+        name = team_data.get("name", team_data.get("team_name", _team_id))
+        token = team_data.get("token", "")
+        if token:
+            tokens[name] = token
+
+    if not tokens:
+        raise click.ClickException("No tokens found in the pasted JSON.")
+
+    # Also need the d cookie — prompt if not already stored
+    cookie = config.get("cookie", "")
+    if not cookie:
+        cookie = click.prompt("Paste d cookie value (xoxd-…)")
+    config["cookie"] = cookie
+
+    _validate_and_save_tokens(config, tokens, cookie)
+
+
+def _login_manual(config: dict, workspace_name: str | None) -> None:
+    """Login with a single manually-pasted token + cookie."""
+    token = click.prompt("Paste xoxc- token")
+    cookie = click.prompt("Paste d cookie value (xoxd-…)")
+    config["cookie"] = cookie
+
+    client = WebClient(token=token, headers={"cookie": f"d={cookie}"})
+    try:
+        resp = client.auth_test()
+    except SlackApiError as exc:
+        raise click.ClickException(
+            f"Auth validation failed: {exc.response['error']}"
+        ) from exc
+
+    team = workspace_name or resp.get("team", "default")
+    user = resp.get("user", "")
+    config["workspaces"][team] = {
+        "token": token,
+        "team": team,
+        "user": user,
+    }
+    if len(config["workspaces"]) == 1:
+        config["default"] = team
+
+    console.print(
+        f"[green]Logged in as [bold]{user}[/bold] "
+        f"in [bold]{team}[/bold][/]"
+    )
+
+
+def _validate_and_save_tokens(
+    config: dict, tokens: dict[str, str], cookie: str
+) -> None:
+    """Validate each token with auth.test and save to config."""
+    first_team = None
+    for ws_name, token in tokens.items():
+        client = WebClient(
+            token=token, headers={"cookie": f"d={cookie}"}
+        )
+        try:
+            resp = client.auth_test()
+        except SlackApiError:
+            console.print(
+                f"[red]Skipping {ws_name}: auth validation failed[/]"
+            )
+            continue
+
+        team = resp.get("team", ws_name)
+        user = resp.get("user", "")
+        config["workspaces"][team] = {
+            "token": token,
+            "team": team,
+            "user": user,
+        }
+        if first_team is None:
+            first_team = team
+        console.print(
+            f"[green]Logged in as [bold]{user}[/bold] "
+            f"in [bold]{team}[/bold][/]"
+        )
+
+    if not config.get("workspaces"):
+        raise click.ClickException("No workspaces could be validated.")
+
+    # Set default to first workspace if not already set
+    if "default" not in config and first_team:
+        config["default"] = first_team
 
 
 # -- workspaces ---------------------------------------------------------------

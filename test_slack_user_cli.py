@@ -360,6 +360,86 @@ class TestLoginManual:
         assert result.exit_code != 0
 
 
+class TestLoginBrowser:
+    @patch("slack_user_cli.WebClient")
+    def test_imports_all_workspaces(self, mock_wc_cls, runner, tmp_config):
+        mock_instance = MagicMock()
+        # Return different team names for each call
+        mock_instance.auth_test.side_effect = [
+            {"user": "alice", "team": "Team Alpha"},
+            {"user": "alice", "team": "Team Beta"},
+        ]
+        mock_wc_cls.return_value = mock_instance
+
+        local_config_json = json.dumps({
+            "teams": {
+                "T001": {"name": "Alpha", "token": "xoxc-alpha"},
+                "T002": {"name": "Beta", "token": "xoxc-beta"},
+            }
+        })
+        # Provide JSON + d cookie (since no cookie stored yet)
+        result = runner.invoke(
+            cli,
+            ["login", "--browser"],
+            input=f"{local_config_json}\nxoxd-cookie\n",
+        )
+        assert "Team Alpha" in result.output
+
+    @patch("slack_user_cli.WebClient")
+    def test_saves_both_workspaces(self, mock_wc_cls, runner, tmp_config):
+        mock_instance = MagicMock()
+        mock_instance.auth_test.side_effect = [
+            {"user": "u1", "team": "WS1"},
+            {"user": "u2", "team": "WS2"},
+        ]
+        mock_wc_cls.return_value = mock_instance
+
+        local_config_json = json.dumps({
+            "teams": {
+                "T1": {"name": "ws1", "token": "xoxc-1"},
+                "T2": {"name": "ws2", "token": "xoxc-2"},
+            }
+        })
+        runner.invoke(
+            cli,
+            ["login", "--browser"],
+            input=f"{local_config_json}\nxoxd-c\n",
+        )
+        config = json.loads(tmp_config.read_text())
+        assert len(config["workspaces"]) == 2
+
+    @patch("slack_user_cli.WebClient")
+    def test_rejects_invalid_json(self, mock_wc_cls, runner, tmp_config):
+        result = runner.invoke(
+            cli,
+            ["login", "--browser"],
+            input="not-json\n",
+        )
+        assert result.exit_code != 0
+
+    @patch("slack_user_cli.WebClient")
+    def test_skips_cookie_prompt_when_already_stored(
+        self, mock_wc_cls, runner, saved_config
+    ):
+        """When a cookie is already in config, don't prompt for it again."""
+        mock_instance = MagicMock()
+        mock_instance.auth_test.return_value = {
+            "user": "u", "team": "New Team"
+        }
+        mock_wc_cls.return_value = mock_instance
+
+        local_config_json = json.dumps({
+            "teams": {"T1": {"name": "new", "token": "xoxc-new"}}
+        })
+        # Only provide JSON, no cookie prompt expected
+        result = runner.invoke(
+            cli,
+            ["login", "--browser"],
+            input=f"{local_config_json}\n",
+        )
+        assert "New Team" in result.output
+
+
 class TestChannelsCommand:
     @patch("slack_user_cli.get_client")
     def test_lists_channels(self, mock_get_client, runner, saved_config):
