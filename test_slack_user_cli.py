@@ -477,13 +477,14 @@ class TestLoginBrowser:
 
 class TestChannelsCommand:
     @patch("slack_user_cli.get_client")
-    def test_lists_channels(self, mock_get_client, runner, saved_config):
+    def test_lists_joined_channels(self, mock_get_client, runner, saved_config):
         mock_client = MagicMock()
         mock_client.conversations_list.return_value = {
             "channels": [
                 {
                     "id": "C1",
                     "name": "general",
+                    "is_member": True,
                     "num_members": 42,
                     "topic": {"value": "General discussion"},
                 }
@@ -496,6 +497,57 @@ class TestChannelsCommand:
         assert "general" in result.output
 
     @patch("slack_user_cli.get_client")
+    def test_hides_unjoined_channels_by_default(
+        self, mock_get_client, runner, saved_config
+    ):
+        mock_client = MagicMock()
+        mock_client.conversations_list.return_value = {
+            "channels": [
+                {
+                    "id": "C1",
+                    "name": "joined",
+                    "is_member": True,
+                    "num_members": 5,
+                    "topic": {"value": ""},
+                },
+                {
+                    "id": "C2",
+                    "name": "not-joined",
+                    "is_member": False,
+                    "num_members": 100,
+                    "topic": {"value": ""},
+                },
+            ],
+            "response_metadata": {"next_cursor": ""},
+        }
+        mock_get_client.return_value = mock_client
+
+        result = runner.invoke(cli, ["channels"])
+        assert "not-joined" not in result.output
+
+    @patch("slack_user_cli.get_client")
+    def test_all_flag_shows_unjoined(
+        self, mock_get_client, runner, saved_config
+    ):
+        mock_client = MagicMock()
+        mock_client.conversations_list.return_value = {
+            "channels": [
+                {
+                    "id": "C2",
+                    "name": "not-joined",
+                    "is_member": False,
+                    "num_members": 100,
+                    "topic": {"value": ""},
+                },
+            ],
+            "response_metadata": {"next_cursor": ""},
+        }
+        mock_get_client.return_value = mock_client
+
+        result = runner.invoke(cli, ["channels", "--all"])
+        assert "not-joined" in result.output
+
+    @patch("slack_user_cli.get_client")
     def test_shows_member_count(self, mock_get_client, runner, saved_config):
         mock_client = MagicMock()
         mock_client.conversations_list.return_value = {
@@ -503,6 +555,7 @@ class TestChannelsCommand:
                 {
                     "id": "C1",
                     "name": "dev",
+                    "is_member": True,
                     "num_members": 15,
                     "topic": {"value": ""},
                 }
@@ -777,6 +830,7 @@ class TestPagination:
                     {
                         "id": "C1",
                         "name": "page1",
+                        "is_member": True,
                         "num_members": 1,
                         "topic": {"value": ""},
                     }
@@ -788,6 +842,7 @@ class TestPagination:
                     {
                         "id": "C2",
                         "name": "page2",
+                        "is_member": True,
                         "num_members": 2,
                         "topic": {"value": ""},
                     }
@@ -811,6 +866,7 @@ class TestPagination:
                     {
                         "id": "C1",
                         "name": "first",
+                        "is_member": True,
                         "num_members": 1,
                         "topic": {"value": ""},
                     }
@@ -822,6 +878,7 @@ class TestPagination:
                     {
                         "id": "C2",
                         "name": "second",
+                        "is_member": True,
                         "num_members": 2,
                         "topic": {"value": ""},
                     }

@@ -465,9 +465,16 @@ def default(name: str) -> None:
     default="public_channel,private_channel",
     help="Comma-separated channel types to list.",
 )
+@click.option(
+    "--all",
+    "show_all",
+    is_flag=True,
+    default=False,
+    help="Show all visible channels, not just joined ones.",
+)
 @click.pass_context
-def channels(ctx: click.Context, channel_types: str) -> None:
-    """List joined channels."""
+def channels(ctx: click.Context, channel_types: str, show_all: bool) -> None:
+    """List joined channels (use --all to include unjoined)."""
     client = get_client(workspace=ctx.obj["workspace"])
     table = Table(title="Channels")
     table.add_column("Name", style="cyan")
@@ -486,6 +493,9 @@ def channels(ctx: click.Context, channel_types: str) -> None:
             raise click.ClickException(str(exc)) from exc
 
         for ch in resp["channels"]:
+            # Skip channels the user hasn't joined unless --all
+            if not show_all and not ch.get("is_member"):
+                continue
             ch_type = _channel_type_label(ch)
             topic = ch.get("topic", {}).get("value", "")
             # Truncate long topics for table readability
