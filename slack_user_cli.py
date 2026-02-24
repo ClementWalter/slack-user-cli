@@ -37,10 +37,29 @@ console = Console()
 
 
 def load_config() -> dict:
-    """Load config from disk, returning empty dict if missing."""
-    if CONFIG_FILE.exists():
-        return json.loads(CONFIG_FILE.read_text())
-    return {}
+    """Load config from disk, returning empty dict if missing.
+
+    Migrates legacy single-workspace format to multi-workspace on read.
+    """
+    if not CONFIG_FILE.exists():
+        return {}
+    config = json.loads(CONFIG_FILE.read_text())
+    # Migrate legacy format: {token, cookie, team, user} → multi-workspace
+    if "token" in config and "workspaces" not in config:
+        team = config.get("team", "default")
+        config = {
+            "cookie": config.get("cookie", ""),
+            "default": team,
+            "workspaces": {
+                team: {
+                    "token": config["token"],
+                    "team": team,
+                    "user": config.get("user", ""),
+                }
+            },
+        }
+        save_config(config)
+    return config
 
 
 def save_config(config: dict) -> None:
@@ -49,7 +68,33 @@ def save_config(config: dict) -> None:
     CONFIG_FILE.write_text(json.dumps(config, indent=2))
 
 
-def get_client(config: dict | None = None) -> WebClient:
+def get_workspace_config(config: dict, workspace: str | None) -> dict:
+    """Extract token + cookie for a specific workspace.
+
+    Returns a dict with 'token' and 'cookie' keys ready for WebClient.
+    """
+    workspaces = config.get("workspaces", {})
+    cookie = config.get("cookie", "")
+
+    if not workspaces:
+        raise click.ClickException(
+            "Not logged in. Run 'login' first to set credentials."
+        )
+
+    if workspace is None:
+        workspace = config.get("default", "")
+
+    if workspace not in workspaces:
+        available = ", ".join(workspaces.keys())
+        raise click.ClickException(
+            f"Workspace '{workspace}' not found. Available: {available}"
+        )
+
+    ws = workspaces[workspace]
+    return {"token": ws["token"], "cookie": cookie}
+
+
+def get_client(config: dict | None = None, workspace: str | None = None) -> WebClient:
     """Build an authenticated WebClient from stored credentials.
 
     The xoxc- token goes in the standard token param while the d cookie
@@ -58,8 +103,9 @@ def get_client(config: dict | None = None) -> WebClient:
     """
     if config is None:
         config = load_config()
-    token = config.get("token")
-    cookie = config.get("cookie")
+    ws = get_workspace_config(config, workspace)
+    token = ws.get("token")
+    cookie = ws.get("cookie")
     if not token or not cookie:
         raise click.ClickException(
             "Not logged in. Run 'login' first to set credentials."
@@ -127,10 +173,20 @@ def resolve_channel(client: WebClient, name_or_id: str) -> str:
 @click.option(
     "--debug", is_flag=True, default=False, help="Enable debug logging."
 )
-def cli(debug: bool) -> None:
+@click.option(
+    "-w",
+    "--workspace",
+    default=None,
+    help="Workspace name to use (defaults to the default workspace).",
+)
+@click.pass_context
+def cli(ctx: click.Context, debug: bool, workspace: str | None) -> None:
     """Slack User CLI — read and write Slack from your terminal."""
     level = logging.DEBUG if debug else logging.WARNING
     logging.basicConfig(level=level, format="%(levelname)s: %(message)s")
+    # Store workspace choice so subcommands can access it
+    ctx.ensure_object(dict)
+    ctx.obj["workspace"] = workspace
 
 
 # -- login --------------------------------------------------------------------
@@ -149,10 +205,22 @@ def cli(debug: bool) -> None:
     flag_value="manual",
     help="Paste credentials from browser DevTools.",
 )
-def login(mode: str | None) -> None:
-    """Authenticate with Slack using session credentials."""
+@click.option(
+    "--workspace-name",
+    default=None,
+    help="Name for this workspace (manual mode only).",
+)
+def login(mode: str | None, workspace_name: str | None) -> None:
+    """Authenticate with Slack using session credentials.
+
+    In auto mode, all workspaces from the Slack desktop app are saved.
+    In manual mode, a single workspace is added.
+    """
     if mode is None:
         mode = "auto"
+
+    config = load_config()
+    config.setdefault("workspaces", {})
 
     if mode == "auto":
         try:
@@ -172,6 +240,7 @@ def login(mode: str | None) -> None:
         )
         result = get_tokens_and_cookie()
         cookie = result.get("cookie", "")
+        config["cookie"] = cookie
 
         # slacktokens returns {cookie: str, tokens: {workspace: token, ...}}
         tokens = result.get("tokens", {})
@@ -180,43 +249,120 @@ def login(mode: str | None) -> None:
                 "No tokens found. Is Slack desktop installed and logged in?"
             )
 
-        if len(tokens) == 1:
-            workspace, token = next(iter(tokens.items()))
-            console.print(f"Found workspace: [bold]{workspace}[/]")
-        else:
-            console.print("Found multiple workspaces:")
-            workspaces = list(tokens.keys())
-            for i, ws in enumerate(workspaces, 1):
-                console.print(f"  {i}. {ws}")
-            choice = click.prompt(
-                "Select workspace", type=int, default=1
+        # Validate and save every workspace
+        first_team = None
+        for ws_name, token in tokens.items():
+            client = WebClient(
+                token=token, headers={"cookie": f"d={cookie}"}
             )
-            workspace = workspaces[choice - 1]
-            token = tokens[workspace]
+            try:
+                resp = client.auth_test()
+            except SlackApiError:
+                console.print(
+                    f"[red]Skipping {ws_name}: auth validation failed[/]"
+                )
+                continue
+
+            team = resp.get("team", ws_name)
+            user = resp.get("user", "")
+            config["workspaces"][team] = {
+                "token": token,
+                "team": team,
+                "user": user,
+            }
+            if first_team is None:
+                first_team = team
+            console.print(
+                f"[green]Logged in as [bold]{user}[/bold] "
+                f"in [bold]{team}[/bold][/]"
+            )
+
+        # Set default to first workspace if not already set
+        if "default" not in config and first_team:
+            config["default"] = first_team
+
     else:
         token = click.prompt("Paste xoxc- token")
         cookie = click.prompt("Paste d cookie value (xoxd-…)")
+        config["cookie"] = cookie
 
-    # Validate before saving
-    client = WebClient(token=token, headers={"cookie": f"d={cookie}"})
-    try:
-        resp = client.auth_test()
-    except SlackApiError as exc:
-        raise click.ClickException(
-            f"Auth validation failed: {exc.response['error']}"
-        ) from exc
+        # Validate before saving
+        client = WebClient(
+            token=token, headers={"cookie": f"d={cookie}"}
+        )
+        try:
+            resp = client.auth_test()
+        except SlackApiError as exc:
+            raise click.ClickException(
+                f"Auth validation failed: {exc.response['error']}"
+            ) from exc
 
-    config = load_config()
-    config["token"] = token
-    config["cookie"] = cookie
-    config["team"] = resp.get("team")
-    config["user"] = resp.get("user")
+        team = workspace_name or resp.get("team", "default")
+        user = resp.get("user", "")
+        config["workspaces"][team] = {
+            "token": token,
+            "team": team,
+            "user": user,
+        }
+        # Set as default if it's the only workspace
+        if len(config["workspaces"]) == 1:
+            config["default"] = team
+
+        console.print(
+            f"[green]Logged in as [bold]{user}[/bold] "
+            f"in [bold]{team}[/bold][/]"
+        )
+
     save_config(config)
 
-    console.print(
-        f"[green]Logged in as [bold]{resp['user']}[/bold] "
-        f"in [bold]{resp['team']}[/bold][/]"
-    )
+    # Show summary of all workspaces
+    ws_count = len(config.get("workspaces", {}))
+    default = config.get("default", "")
+    if ws_count > 1:
+        console.print(f"\n[bold]{ws_count} workspaces saved.[/] Default: [cyan]{default}[/]")
+        console.print("[dim]Use -w <name> to switch, or 'workspaces' to list all.[/]")
+
+
+# -- workspaces ---------------------------------------------------------------
+
+
+@cli.command()
+def workspaces() -> None:
+    """List all saved workspaces."""
+    config = load_config()
+    ws_map = config.get("workspaces", {})
+    default = config.get("default", "")
+
+    if not ws_map:
+        raise click.ClickException("No workspaces saved. Run 'login' first.")
+
+    table = Table(title="Workspaces")
+    table.add_column("Name", style="cyan")
+    table.add_column("User")
+    table.add_column("Default")
+
+    for name, ws in ws_map.items():
+        is_default = "yes" if name == default else ""
+        table.add_row(name, ws.get("user", ""), is_default)
+
+    console.print(table)
+    console.print("[dim]Use -w <name> to switch workspace for a command.[/]")
+
+
+@cli.command()
+@click.argument("name")
+def default(name: str) -> None:
+    """Set the default workspace."""
+    config = load_config()
+    ws_map = config.get("workspaces", {})
+    if name not in ws_map:
+        available = ", ".join(ws_map.keys())
+        raise click.ClickException(
+            f"Workspace '{name}' not found. Available: {available}"
+        )
+    config["default"] = name
+    save_config(config)
+    console.print(f"[green]Default workspace set to [bold]{name}[/bold][/]")
 
 
 # -- channels -----------------------------------------------------------------
@@ -229,9 +375,10 @@ def login(mode: str | None) -> None:
     default="public_channel,private_channel",
     help="Comma-separated channel types to list.",
 )
-def channels(channel_types: str) -> None:
+@click.pass_context
+def channels(ctx: click.Context, channel_types: str) -> None:
     """List joined channels."""
-    client = get_client()
+    client = get_client(workspace=ctx.obj["workspace"])
     table = Table(title="Channels")
     table.add_column("Name", style="cyan")
     table.add_column("Type", style="magenta")
@@ -285,9 +432,10 @@ def _channel_type_label(ch: dict) -> str:
 @cli.command()
 @click.argument("channel")
 @click.option("--limit", default=20, help="Number of messages to show.")
-def read(channel: str, limit: int) -> None:
+@click.pass_context
+def read(ctx: click.Context, channel: str, limit: int) -> None:
     """Read recent messages from a channel."""
-    client = get_client()
+    client = get_client(workspace=ctx.obj["workspace"])
     channel_id = resolve_channel(client, channel)
 
     messages: list[dict] = []
@@ -322,9 +470,10 @@ def read(channel: str, limit: int) -> None:
 @click.argument("channel")
 @click.argument("ts")
 @click.option("--limit", default=50, help="Number of replies to show.")
-def thread(channel: str, ts: str, limit: int) -> None:
+@click.pass_context
+def thread(ctx: click.Context, channel: str, ts: str, limit: int) -> None:
     """Read thread replies for a given message timestamp."""
-    client = get_client()
+    client = get_client(workspace=ctx.obj["workspace"])
     channel_id = resolve_channel(client, channel)
 
     replies: list[dict] = []
@@ -355,9 +504,10 @@ def thread(channel: str, ts: str, limit: int) -> None:
 
 
 @cli.command()
-def users() -> None:
+@click.pass_context
+def users(ctx: click.Context) -> None:
     """List workspace members."""
-    client = get_client()
+    client = get_client(workspace=ctx.obj["workspace"])
     table = Table(title="Users")
     table.add_column("Display Name", style="cyan")
     table.add_column("Real Name")
@@ -398,9 +548,10 @@ def users() -> None:
 @cli.command()
 @click.argument("channel")
 @click.argument("message")
-def send(channel: str, message: str) -> None:
+@click.pass_context
+def send(ctx: click.Context, channel: str, message: str) -> None:
     """Send a message to a channel."""
-    client = get_client()
+    client = get_client(workspace=ctx.obj["workspace"])
     channel_id = resolve_channel(client, channel)
 
     try:
@@ -419,9 +570,10 @@ def send(channel: str, message: str) -> None:
 @click.argument("user")
 @click.argument("message", required=False, default=None)
 @click.option("--limit", default=20, help="Messages to show when reading.")
-def dm(user: str, message: str | None, limit: int) -> None:
+@click.pass_context
+def dm(ctx: click.Context, user: str, message: str | None, limit: int) -> None:
     """Open a DM with a user. Send a message or read recent history."""
-    client = get_client()
+    client = get_client(workspace=ctx.obj["workspace"])
 
     # Resolve user name to ID if needed (simple heuristic: IDs start with U)
     user_id = user
@@ -485,9 +637,10 @@ def _resolve_user_by_name(client: WebClient, name: str) -> str:
 @click.argument("query")
 @click.option("--count", default=20, help="Results per page.")
 @click.option("--page", default=1, help="Page number.")
-def search(query: str, count: int, page: int) -> None:
+@click.pass_context
+def search(ctx: click.Context, query: str, count: int, page: int) -> None:
     """Search messages across the workspace."""
-    client = get_client()
+    client = get_client(workspace=ctx.obj["workspace"])
 
     try:
         # search.messages uses page-based pagination (not cursor)

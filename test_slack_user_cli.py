@@ -28,6 +28,7 @@ from slack_user_cli import (
     _format_ts,
     cli,
     get_client,
+    get_workspace_config,
     load_config,
     resolve_channel,
     resolve_user,
@@ -56,10 +57,30 @@ def tmp_config(tmp_path, monkeypatch):
 
 @pytest.fixture()
 def saved_config(tmp_config):
-    """Write a valid config and return its path."""
+    """Write a valid multi-workspace config and return its path."""
     tmp_config.parent.mkdir(parents=True, exist_ok=True)
     tmp_config.write_text(
-        json.dumps({"token": "xoxc-test", "cookie": "xoxd-test"})
+        json.dumps({
+            "cookie": "xoxd-test",
+            "default": "testteam",
+            "workspaces": {
+                "testteam": {
+                    "token": "xoxc-test",
+                    "team": "testteam",
+                    "user": "testuser",
+                }
+            },
+        })
+    )
+    return tmp_config
+
+
+@pytest.fixture()
+def legacy_config(tmp_config):
+    """Write a legacy single-workspace config for migration tests."""
+    tmp_config.parent.mkdir(parents=True, exist_ok=True)
+    tmp_config.write_text(
+        json.dumps({"token": "xoxc-test", "cookie": "xoxd-test", "team": "legacyteam", "user": "legacyuser"})
     )
     return tmp_config
 
@@ -85,50 +106,96 @@ class TestLoadConfig:
     def test_returns_empty_dict_when_missing(self, tmp_config):
         assert load_config() == {}
 
-    def test_returns_saved_data(self, saved_config):
+    def test_returns_workspaces(self, saved_config):
         config = load_config()
-        assert config["token"] == "xoxc-test"
+        assert "testteam" in config["workspaces"]
 
     def test_returns_cookie(self, saved_config):
         config = load_config()
         assert config["cookie"] == "xoxd-test"
 
+    def test_migrates_legacy_format(self, legacy_config):
+        """Legacy {token, cookie} config is auto-migrated to multi-workspace."""
+        config = load_config()
+        assert "workspaces" in config
+
+    def test_legacy_migration_preserves_token(self, legacy_config):
+        config = load_config()
+        assert config["workspaces"]["legacyteam"]["token"] == "xoxc-test"
+
+    def test_legacy_migration_sets_default(self, legacy_config):
+        config = load_config()
+        assert config["default"] == "legacyteam"
+
 
 class TestSaveConfig:
     def test_creates_file(self, tmp_config):
-        save_config({"token": "t", "cookie": "c"})
+        save_config({"cookie": "c", "workspaces": {}})
         assert tmp_config.exists()
 
-    def test_persists_token(self, tmp_config):
-        save_config({"token": "xoxc-new", "cookie": "xoxd-new"})
+    def test_persists_data(self, tmp_config):
+        save_config({"cookie": "xoxd-new", "workspaces": {"ws": {"token": "t"}}})
         data = json.loads(tmp_config.read_text())
-        assert data["token"] == "xoxc-new"
+        assert data["cookie"] == "xoxd-new"
 
     def test_creates_parent_dirs(self, tmp_config):
         # Ensure parent doesn't exist yet
         assert not tmp_config.parent.exists()
-        save_config({"token": "t", "cookie": "c"})
+        save_config({"cookie": "c", "workspaces": {}})
         assert tmp_config.parent.exists()
+
+
+# -- get_workspace_config tests -----------------------------------------------
+
+
+class TestGetWorkspaceConfig:
+    def test_raises_when_no_workspaces(self):
+        with pytest.raises(Exception, match="Not logged in"):
+            get_workspace_config({}, None)
+
+    def test_raises_when_workspace_not_found(self):
+        config = {"workspaces": {"team1": {"token": "t"}}, "cookie": "c"}
+        with pytest.raises(Exception, match="not found"):
+            get_workspace_config(config, "nonexistent")
+
+    def test_returns_token_and_cookie(self):
+        config = {
+            "workspaces": {"myteam": {"token": "xoxc-t"}},
+            "cookie": "xoxd-c",
+            "default": "myteam",
+        }
+        ws = get_workspace_config(config, None)
+        assert ws["token"] == "xoxc-t"
+
+    def test_uses_default_workspace(self):
+        config = {
+            "workspaces": {"a": {"token": "ta"}, "b": {"token": "tb"}},
+            "cookie": "c",
+            "default": "b",
+        }
+        ws = get_workspace_config(config, None)
+        assert ws["token"] == "tb"
+
+    def test_explicit_workspace_overrides_default(self):
+        config = {
+            "workspaces": {"a": {"token": "ta"}, "b": {"token": "tb"}},
+            "cookie": "c",
+            "default": "a",
+        }
+        ws = get_workspace_config(config, "b")
+        assert ws["token"] == "tb"
 
 
 # -- get_client tests ---------------------------------------------------------
 
 
 class TestGetClient:
-    def test_raises_when_no_config(self, tmp_config):
+    def test_raises_when_empty_config(self, tmp_config):
         with pytest.raises(Exception, match="Not logged in"):
             get_client({})
 
-    def test_raises_when_missing_token(self, tmp_config):
-        with pytest.raises(Exception, match="Not logged in"):
-            get_client({"cookie": "c"})
-
-    def test_raises_when_missing_cookie(self, tmp_config):
-        with pytest.raises(Exception, match="Not logged in"):
-            get_client({"token": "t"})
-
     def test_returns_client_with_valid_config(self, saved_config):
-        client = get_client({"token": "xoxc-t", "cookie": "xoxd-c"})
+        client = get_client()
         assert client is not None
 
 
@@ -271,7 +338,8 @@ class TestLoginManual:
             input="xoxc-tok\nxoxd-cook\n",
         )
         config = json.loads(tmp_config.read_text())
-        assert config["token"] == "xoxc-tok"
+        # Multi-workspace format: token stored under workspaces
+        assert config["workspaces"]["t"]["token"] == "xoxc-tok"
 
     @patch("slack_user_cli.WebClient")
     def test_login_fails_on_auth_error(self, mock_wc_cls, runner, tmp_config):
@@ -650,3 +718,46 @@ class TestPagination:
 
         result = runner.invoke(cli, ["channels"])
         assert "second" in result.output
+
+
+# -- Workspace management tests -----------------------------------------------
+
+
+class TestWorkspacesCommand:
+    def test_lists_workspaces(self, runner, saved_config):
+        result = runner.invoke(cli, ["workspaces"])
+        assert "testteam" in result.output
+
+    def test_shows_default_marker(self, runner, saved_config):
+        result = runner.invoke(cli, ["workspaces"])
+        assert "yes" in result.output
+
+    def test_errors_when_no_workspaces(self, runner, tmp_config):
+        result = runner.invoke(cli, ["workspaces"])
+        assert result.exit_code != 0
+
+
+class TestDefaultCommand:
+    def test_sets_default(self, runner, saved_config):
+        result = runner.invoke(cli, ["default", "testteam"])
+        assert "Default workspace set to" in result.output
+
+    def test_errors_on_unknown_workspace(self, runner, saved_config):
+        result = runner.invoke(cli, ["default", "nonexistent"])
+        assert result.exit_code != 0
+
+
+class TestWorkspaceSwitch:
+    @patch("slack_user_cli.get_client")
+    def test_workspace_flag_passed_to_get_client(
+        self, mock_get_client, runner, saved_config
+    ):
+        mock_client = MagicMock()
+        mock_client.conversations_list.return_value = {
+            "channels": [],
+            "response_metadata": {"next_cursor": ""},
+        }
+        mock_get_client.return_value = mock_client
+
+        runner.invoke(cli, ["-w", "testteam", "channels"])
+        mock_get_client.assert_called_once_with(workspace="testteam")
