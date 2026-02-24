@@ -26,6 +26,10 @@ from slack_sdk.errors import SlackApiError
 from slack_user_cli import (
     _channel_type_label,
     _format_ts,
+    _load_cache,
+    _save_cache,
+    build_channel_cache,
+    build_user_cache,
     cli,
     get_client,
     get_workspace_config,
@@ -301,6 +305,241 @@ class TestFormatTs:
 
     def test_empty_string_returns_original(self):
         assert _format_ts("") == ""
+
+
+# -- Cache tests --------------------------------------------------------------
+
+
+class TestSaveCache:
+    def test_creates_cache_file(self, tmp_config):
+        _save_cache("testws", "channels", {"general": "C1"})
+        from slack_user_cli import CONFIG_DIR
+
+        path = CONFIG_DIR / "cache" / "testws" / "channels.json"
+        assert path.exists()
+
+    def test_stores_data_with_timestamp(self, tmp_config):
+        _save_cache("testws", "channels", {"general": "C1"})
+        from slack_user_cli import CONFIG_DIR
+
+        path = CONFIG_DIR / "cache" / "testws" / "channels.json"
+        content = json.loads(path.read_text())
+        assert content["data"] == {"general": "C1"}
+
+    def test_stores_timestamp(self, tmp_config):
+        _save_cache("testws", "channels", {"general": "C1"})
+        from slack_user_cli import CONFIG_DIR
+
+        path = CONFIG_DIR / "cache" / "testws" / "channels.json"
+        content = json.loads(path.read_text())
+        assert "ts" in content
+
+
+class TestLoadCache:
+    def test_returns_none_when_missing(self, tmp_config):
+        assert _load_cache("testws", "channels") is None
+
+    def test_returns_data_when_valid(self, tmp_config):
+        _save_cache("testws", "channels", {"general": "C1"})
+        result = _load_cache("testws", "channels")
+        assert result == {"general": "C1"}
+
+    def test_returns_none_when_expired(self, tmp_config):
+        _save_cache("testws", "channels", {"general": "C1"})
+        from slack_user_cli import CONFIG_DIR
+
+        # Overwrite with an expired timestamp (2 hours ago)
+        path = CONFIG_DIR / "cache" / "testws" / "channels.json"
+        import time
+
+        expired = json.dumps({"ts": time.time() - 7200, "data": {"general": "C1"}})
+        path.write_text(expired)
+        assert _load_cache("testws", "channels") is None
+
+    def test_returns_none_on_invalid_json(self, tmp_config):
+        from slack_user_cli import CONFIG_DIR
+
+        path = CONFIG_DIR / "cache" / "testws" / "channels.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("not-json")
+        assert _load_cache("testws", "channels") is None
+
+
+class TestBuildChannelCache:
+    def test_returns_name_to_id_map(self, mock_client, tmp_config):
+        mock_client.conversations_list.return_value = {
+            "channels": [
+                {"id": "C1", "name": "general"},
+                {"id": "C2", "name": "random"},
+            ],
+            "response_metadata": {"next_cursor": ""},
+        }
+        result = build_channel_cache(mock_client, "testws")
+        assert result == {"general": "C1", "random": "C2"}
+
+    def test_saves_to_disk(self, mock_client, tmp_config):
+        mock_client.conversations_list.return_value = {
+            "channels": [{"id": "C1", "name": "general"}],
+            "response_metadata": {"next_cursor": ""},
+        }
+        build_channel_cache(mock_client, "testws")
+        cached = _load_cache("testws", "channels")
+        assert cached == {"general": "C1"}
+
+    def test_follows_pagination(self, mock_client, tmp_config):
+        mock_client.conversations_list.side_effect = [
+            {
+                "channels": [{"id": "C1", "name": "page1"}],
+                "response_metadata": {"next_cursor": "cursor1"},
+            },
+            {
+                "channels": [{"id": "C2", "name": "page2"}],
+                "response_metadata": {"next_cursor": ""},
+            },
+        ]
+        result = build_channel_cache(mock_client, "testws")
+        assert "page1" in result
+        assert "page2" in result
+
+
+class TestBuildUserCache:
+    def test_returns_id_to_display(self, mock_client, tmp_config):
+        mock_client.users_list.return_value = {
+            "members": [
+                {
+                    "id": "U1",
+                    "name": "alice",
+                    "real_name": "Alice Smith",
+                    "profile": {"display_name": "alice.s"},
+                }
+            ],
+            "response_metadata": {"next_cursor": ""},
+        }
+        result = build_user_cache(mock_client, "testws")
+        assert result["id_to_display"]["U1"] == "alice.s"
+
+    def test_returns_name_to_id(self, mock_client, tmp_config):
+        mock_client.users_list.return_value = {
+            "members": [
+                {
+                    "id": "U1",
+                    "name": "alice",
+                    "profile": {"display_name": "alice.s"},
+                }
+            ],
+            "response_metadata": {"next_cursor": ""},
+        }
+        result = build_user_cache(mock_client, "testws")
+        assert result["name_to_id"]["alice"] == "U1"
+
+    def test_returns_display_to_id(self, mock_client, tmp_config):
+        mock_client.users_list.return_value = {
+            "members": [
+                {
+                    "id": "U1",
+                    "name": "alice",
+                    "profile": {"display_name": "alice.s"},
+                }
+            ],
+            "response_metadata": {"next_cursor": ""},
+        }
+        result = build_user_cache(mock_client, "testws")
+        assert result["display_to_id"]["alice.s"] == "U1"
+
+    def test_saves_to_disk(self, mock_client, tmp_config):
+        mock_client.users_list.return_value = {
+            "members": [
+                {
+                    "id": "U1",
+                    "name": "bob",
+                    "profile": {"display_name": "Bob"},
+                }
+            ],
+            "response_metadata": {"next_cursor": ""},
+        }
+        build_user_cache(mock_client, "testws")
+        cached = _load_cache("testws", "users")
+        assert cached["id_to_display"]["U1"] == "Bob"
+
+
+class TestResolveUserWithCache:
+    def test_uses_disk_cache(self, mock_client, tmp_config):
+        """When disk cache has the user, don't call the API at all."""
+        _save_cache("testws", "users", {
+            "id_to_display": {"U1": "alice"},
+            "name_to_id": {},
+            "display_to_id": {},
+        })
+        result = resolve_user(mock_client, "U1", workspace="testws")
+        assert result == "alice"
+        # No API call should have been made
+        mock_client.users_info.assert_not_called()
+
+    def test_falls_back_to_api_on_cache_miss(self, mock_client, tmp_config):
+        """When disk cache doesn't have the user, fall back to users_info."""
+        _save_cache("testws", "users", {
+            "id_to_display": {},
+            "name_to_id": {},
+            "display_to_id": {},
+        })
+        mock_client.users_info.return_value = {
+            "user": {"profile": {"display_name": "bob"}, "real_name": "Bob"}
+        }
+        result = resolve_user(mock_client, "U999", workspace="testws")
+        assert result == "bob"
+
+    def test_no_cache_falls_back_to_api(self, mock_client, tmp_config):
+        """When no disk cache exists, fall back to users_info (not build)."""
+        mock_client.users_info.return_value = {
+            "user": {"profile": {"display_name": "charlie"}}
+        }
+        result = resolve_user(mock_client, "U1", workspace="testws")
+        assert result == "charlie"
+        # Should NOT have called users_list (no full cache build)
+        mock_client.users_list.assert_not_called()
+
+
+class TestRefreshCommand:
+    @patch("slack_user_cli.get_client")
+    def test_refresh_builds_caches(self, mock_get_client, runner, saved_config):
+        mock_client = MagicMock()
+        mock_client.conversations_list.return_value = {
+            "channels": [{"id": "C1", "name": "general"}],
+            "response_metadata": {"next_cursor": ""},
+        }
+        mock_client.users_list.return_value = {
+            "members": [
+                {
+                    "id": "U1",
+                    "name": "alice",
+                    "profile": {"display_name": "Alice"},
+                }
+            ],
+            "response_metadata": {"next_cursor": ""},
+        }
+        mock_get_client.return_value = mock_client
+
+        result = runner.invoke(cli, ["refresh"])
+        assert "Cache refreshed" in result.output
+
+    @patch("slack_user_cli.get_client")
+    def test_refresh_shows_channel_count(self, mock_get_client, runner, saved_config):
+        mock_client = MagicMock()
+        mock_client.conversations_list.return_value = {
+            "channels": [
+                {"id": "C1", "name": "a"},
+                {"id": "C2", "name": "b"},
+            ],
+            "response_metadata": {"next_cursor": ""},
+        }
+        mock_client.users_list.return_value = {
+            "members": [],
+            "response_metadata": {"next_cursor": ""},
+        }
+        mock_get_client.return_value = mock_client
+
+        result = runner.invoke(cli, ["refresh"])
+        assert "2" in result.output
 
 
 # -- CLI command tests --------------------------------------------------------

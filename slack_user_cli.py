@@ -18,6 +18,7 @@ or browser DevTools. No Slack app registration needed.
 import json
 import logging
 import subprocess
+import time
 from pathlib import Path
 
 import click
@@ -114,20 +115,158 @@ def get_client(config: dict | None = None, workspace: str | None = None) -> WebC
     return WebClient(token=token, headers={"cookie": f"d={cookie}"})
 
 
-# -- User cache for display name resolution -----------------------------------
+# -- Disk-backed cache --------------------------------------------------------
 
-# Module-level cache to avoid repeated API calls within a session
+# Cache TTL: 1 hour — channels and users rarely change
+CACHE_TTL_SECONDS = 3600
+
+# In-memory user display name cache (populated from disk + API)
 _user_cache: dict[str, str] = {}
 
 
-def resolve_user(client: WebClient, user_id: str) -> str:
-    """Resolve a Slack user ID to a display name, with caching."""
+def _cache_path(workspace: str, kind: str) -> Path:
+    """Return the cache file path for a workspace and cache kind.
+
+    Derived from CONFIG_DIR at call time so monkeypatching works in tests.
+    """
+    return CONFIG_DIR / "cache" / workspace / f"{kind}.json"
+
+
+def _load_cache(workspace: str, kind: str) -> dict | None:
+    """Load a cache file if it exists and hasn't expired."""
+    path = _cache_path(workspace, kind)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    # Check TTL
+    if time.time() - data.get("ts", 0) > CACHE_TTL_SECONDS:
+        logger.debug("Cache expired for %s/%s", workspace, kind)
+        return None
+    return data.get("data")
+
+
+def _save_cache(workspace: str, kind: str, data: dict) -> None:
+    """Save data to a cache file with a timestamp."""
+    path = _cache_path(workspace, kind)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"ts": time.time(), "data": data}))
+
+
+def _get_active_workspace(config: dict | None = None, workspace: str | None = None) -> str:
+    """Resolve the active workspace name for cache keying."""
+    if config is None:
+        config = load_config()
+    if workspace is None:
+        workspace = config.get("default", "")
+    return workspace
+
+
+def build_channel_cache(client: WebClient, workspace: str) -> dict[str, str]:
+    """Fetch all channels and build a name→id mapping, saving to disk."""
+    name_to_id: dict[str, str] = {}
+    cursor = None
+    while True:
+        kwargs: dict = {
+            "types": "public_channel,private_channel,mpim,im",
+            "limit": 200,
+        }
+        if cursor:
+            kwargs["cursor"] = cursor
+        resp = client.conversations_list(**kwargs)
+        for ch in resp["channels"]:
+            name = ch.get("name", "")
+            if name:
+                name_to_id[name] = ch["id"]
+        cursor = resp.get("response_metadata", {}).get("next_cursor")
+        if not cursor:
+            break
+    _save_cache(workspace, "channels", name_to_id)
+    logger.debug("Cached %d channels for %s", len(name_to_id), workspace)
+    return name_to_id
+
+
+def build_user_cache(client: WebClient, workspace: str) -> dict:
+    """Fetch all users and build lookup maps, saving to disk.
+
+    Returns dict with:
+      - id_to_display: {user_id: display_name}
+      - name_to_id: {username: user_id}
+      - display_to_id: {display_name: user_id}
+    """
+    id_to_display: dict[str, str] = {}
+    name_to_id: dict[str, str] = {}
+    display_to_id: dict[str, str] = {}
+    cursor = None
+    while True:
+        kwargs: dict = {"limit": 200}
+        if cursor:
+            kwargs["cursor"] = cursor
+        resp = client.users_list(**kwargs)
+        for member in resp["members"]:
+            uid = member["id"]
+            username = member.get("name", "")
+            profile = member.get("profile", {})
+            display = profile.get("display_name") or member.get("real_name") or username
+            id_to_display[uid] = display
+            if username:
+                name_to_id[username] = uid
+            if profile.get("display_name"):
+                display_to_id[profile["display_name"]] = uid
+        cursor = resp.get("response_metadata", {}).get("next_cursor")
+        if not cursor:
+            break
+    data = {
+        "id_to_display": id_to_display,
+        "name_to_id": name_to_id,
+        "display_to_id": display_to_id,
+    }
+    _save_cache(workspace, "users", data)
+    logger.debug("Cached %d users for %s", len(id_to_display), workspace)
+    return data
+
+
+def _get_channel_cache(client: WebClient, workspace: str) -> dict[str, str]:
+    """Get channel name→id map from cache or API."""
+    cached = _load_cache(workspace, "channels")
+    if cached is not None:
+        return cached
+    return build_channel_cache(client, workspace)
+
+
+def _get_user_cache(client: WebClient, workspace: str) -> dict:
+    """Get user lookup maps from cache or API."""
+    cached = _load_cache(workspace, "users")
+    if cached is not None:
+        return cached
+    return build_user_cache(client, workspace)
+
+
+def resolve_user(client: WebClient, user_id: str, workspace: str = "") -> str:
+    """Resolve a Slack user ID to a display name, using disk cache.
+
+    Only reads the disk cache passively — never triggers a full users_list
+    build. This keeps individual user lookups fast and avoids pagination
+    storms when the cache hasn't been built yet.
+    """
     if user_id in _user_cache:
         return _user_cache[user_id]
+
+    # Passively check disk cache (no API call if missing)
+    if workspace:
+        cached = _load_cache(workspace, "users")
+        if cached is not None:
+            name = cached.get("id_to_display", {}).get(user_id)
+            if name:
+                _user_cache[user_id] = name
+                return name
+
+    # Fall back to single API call for unknown users
     try:
         resp = client.users_info(user=user_id)
         user = resp["user"]
-        # Prefer display_name, fall back to real_name, then user ID
         name = (
             user.get("profile", {}).get("display_name")
             or user.get("real_name")
@@ -141,28 +280,40 @@ def resolve_user(client: WebClient, user_id: str) -> str:
         return user_id
 
 
-def resolve_channel(client: WebClient, name_or_id: str) -> str:
+def resolve_channel(client: WebClient, name_or_id: str, workspace: str = "") -> str:
     """Resolve a channel name (without #) to its ID, or pass through an ID."""
     # Already an ID — starts with C, D, or G
     if name_or_id[0] in ("C", "D", "G") and name_or_id[1:].isalnum():
         return name_or_id
 
-    # Walk paginated channel list looking for a name match
-    cursor = None
-    while True:
-        kwargs: dict = {
-            "types": "public_channel,private_channel,mpim,im",
-            "limit": 200,
-        }
-        if cursor:
-            kwargs["cursor"] = cursor
-        resp = client.conversations_list(**kwargs)
-        for ch in resp["channels"]:
-            if ch.get("name") == name_or_id:
-                return ch["id"]
-        cursor = resp.get("response_metadata", {}).get("next_cursor")
-        if not cursor:
-            break
+    # Check disk cache first
+    if workspace:
+        channel_map = _get_channel_cache(client, workspace)
+        if name_or_id in channel_map:
+            return channel_map[name_or_id]
+
+    # Cache miss — walk the API (and rebuild cache while we're at it)
+    channel_map = build_channel_cache(client, workspace) if workspace else {}
+    if name_or_id in channel_map:
+        return channel_map[name_or_id]
+
+    # Final fallback: paginate without caching (no workspace context)
+    if not workspace:
+        cursor = None
+        while True:
+            kwargs: dict = {
+                "types": "public_channel,private_channel,mpim,im",
+                "limit": 200,
+            }
+            if cursor:
+                kwargs["cursor"] = cursor
+            resp = client.conversations_list(**kwargs)
+            for ch in resp["channels"]:
+                if ch.get("name") == name_or_id:
+                    return ch["id"]
+            cursor = resp.get("response_metadata", {}).get("next_cursor")
+            if not cursor:
+                break
 
     raise click.ClickException(f"Channel '{name_or_id}' not found.")
 
@@ -185,9 +336,11 @@ def cli(ctx: click.Context, debug: bool, workspace: str | None) -> None:
     """Slack User CLI — read and write Slack from your terminal."""
     level = logging.DEBUG if debug else logging.WARNING
     logging.basicConfig(level=level, format="%(levelname)s: %(message)s")
-    # Store workspace choice so subcommands can access it
+    # Resolve and store the active workspace name for cache keying
     ctx.ensure_object(dict)
     ctx.obj["workspace"] = workspace
+    config = load_config()
+    ctx.obj["workspace_name"] = _get_active_workspace(config, workspace)
 
 
 # -- login --------------------------------------------------------------------
@@ -455,6 +608,22 @@ def default(name: str) -> None:
     console.print(f"[green]Default workspace set to [bold]{name}[/bold][/]")
 
 
+@cli.command()
+@click.pass_context
+def refresh(ctx: click.Context) -> None:
+    """Force-refresh the channel and user cache for the active workspace."""
+    client = get_client(workspace=ctx.obj["workspace"])
+    ws = ctx.obj["workspace_name"]
+
+    console.print(f"[yellow]Refreshing cache for {ws}…[/]")
+    ch_map = build_channel_cache(client, ws)
+    console.print(f"  Cached [bold]{len(ch_map)}[/] channels")
+    user_data = build_user_cache(client, ws)
+    user_count = len(user_data.get("id_to_display", {}))
+    console.print(f"  Cached [bold]{user_count}[/] users")
+    console.print("[green]Cache refreshed.[/]")
+
+
 # -- channels -----------------------------------------------------------------
 
 
@@ -536,7 +705,8 @@ def _channel_type_label(ch: dict) -> str:
 def read(ctx: click.Context, channel: str, limit: int) -> None:
     """Read recent messages from a channel."""
     client = get_client(workspace=ctx.obj["workspace"])
-    channel_id = resolve_channel(client, channel)
+    ws = ctx.obj["workspace_name"]
+    channel_id = resolve_channel(client, channel, workspace=ws)
 
     messages: list[dict] = []
     cursor = None
@@ -560,7 +730,7 @@ def read(ctx: click.Context, channel: str, limit: int) -> None:
     # Messages come newest-first; reverse for chronological display
     messages = messages[:limit]
     messages.reverse()
-    _print_messages(client, messages)
+    _print_messages(client, messages, workspace=ws)
 
 
 # -- thread -------------------------------------------------------------------
@@ -570,11 +740,25 @@ def read(ctx: click.Context, channel: str, limit: int) -> None:
 @click.argument("channel")
 @click.argument("ts")
 @click.option("--limit", default=50, help="Number of replies to show.")
+@click.option("--dm", "is_dm", is_flag=True, default=False, help="Treat CHANNEL as a user name and resolve to DM channel.")
 @click.pass_context
-def thread(ctx: click.Context, channel: str, ts: str, limit: int) -> None:
+def thread(ctx: click.Context, channel: str, ts: str, limit: int, is_dm: bool) -> None:
     """Read thread replies for a given message timestamp."""
     client = get_client(workspace=ctx.obj["workspace"])
-    channel_id = resolve_channel(client, channel)
+    ws = ctx.obj["workspace_name"]
+
+    if is_dm:
+        # Resolve user name to DM channel
+        user_id = channel
+        if not (channel.startswith("U") and channel[1:].isalnum()):
+            user_id = _resolve_user_by_name(client, channel, workspace=ws)
+        try:
+            resp = client.conversations_open(users=[user_id])
+        except SlackApiError as exc:
+            raise click.ClickException(str(exc)) from exc
+        channel_id = resp["channel"]["id"]
+    else:
+        channel_id = resolve_channel(client, channel, workspace=ws)
 
     replies: list[dict] = []
     cursor = None
@@ -597,7 +781,7 @@ def thread(ctx: click.Context, channel: str, ts: str, limit: int) -> None:
             break
 
     replies = replies[:limit]
-    _print_messages(client, replies)
+    _print_messages(client, replies, workspace=ws)
 
 
 # -- users --------------------------------------------------------------------
@@ -648,14 +832,20 @@ def users(ctx: click.Context) -> None:
 @cli.command()
 @click.argument("channel")
 @click.argument("message")
+@click.option("--thread", "thread_ts", default=None, help="Reply in thread (message timestamp).")
 @click.pass_context
-def send(ctx: click.Context, channel: str, message: str) -> None:
-    """Send a message to a channel."""
+def send(ctx: click.Context, channel: str, message: str, thread_ts: str | None) -> None:
+    """Send a message to a channel. Use --thread to reply in a thread."""
     client = get_client(workspace=ctx.obj["workspace"])
-    channel_id = resolve_channel(client, channel)
+    ws = ctx.obj["workspace_name"]
+    channel_id = resolve_channel(client, channel, workspace=ws)
+
+    kwargs: dict = {"channel": channel_id, "text": message}
+    if thread_ts:
+        kwargs["thread_ts"] = thread_ts
 
     try:
-        resp = client.chat_postMessage(channel=channel_id, text=message)
+        resp = client.chat_postMessage(**kwargs)
     except SlackApiError as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -670,15 +860,17 @@ def send(ctx: click.Context, channel: str, message: str) -> None:
 @click.argument("user")
 @click.argument("message", required=False, default=None)
 @click.option("--limit", default=20, help="Messages to show when reading.")
+@click.option("--thread", "thread_ts", default=None, help="Reply in thread (message timestamp).")
 @click.pass_context
-def dm(ctx: click.Context, user: str, message: str | None, limit: int) -> None:
+def dm(ctx: click.Context, user: str, message: str | None, limit: int, thread_ts: str | None) -> None:
     """Open a DM with a user. Send a message or read recent history."""
     client = get_client(workspace=ctx.obj["workspace"])
+    ws = ctx.obj["workspace_name"]
 
     # Resolve user name to ID if needed (simple heuristic: IDs start with U)
     user_id = user
     if not (user.startswith("U") and user[1:].isalnum()):
-        user_id = _resolve_user_by_name(client, user)
+        user_id = _resolve_user_by_name(client, user, workspace=ws)
 
     # Open (or retrieve) the DM channel
     try:
@@ -689,14 +881,16 @@ def dm(ctx: click.Context, user: str, message: str | None, limit: int) -> None:
     dm_channel = resp["channel"]["id"]
 
     if message:
+        kwargs: dict = {"channel": dm_channel, "text": message}
+        if thread_ts:
+            kwargs["thread_ts"] = thread_ts
         try:
-            send_resp = client.chat_postMessage(
-                channel=dm_channel, text=message
-            )
+            send_resp = client.chat_postMessage(**kwargs)
         except SlackApiError as exc:
             raise click.ClickException(str(exc)) from exc
+        label = "DM thread reply sent" if thread_ts else "DM sent"
         console.print(
-            f"[green]DM sent[/] (ts={send_resp.get('ts', '')})"
+            f"[green]{label}[/] (ts={send_resp.get('ts', '')})"
         )
     else:
         # Read recent DM history
@@ -707,11 +901,24 @@ def dm(ctx: click.Context, user: str, message: str | None, limit: int) -> None:
         except SlackApiError as exc:
             raise click.ClickException(str(exc)) from exc
         messages = list(reversed(hist.get("messages", [])))
-        _print_messages(client, messages)
+        _print_messages(client, messages, workspace=ws)
 
 
-def _resolve_user_by_name(client: WebClient, name: str) -> str:
-    """Walk the users list to find a user by display_name or name."""
+def _resolve_user_by_name(
+    client: WebClient, name: str, workspace: str = ""
+) -> str:
+    """Resolve a user by username or display_name, using disk cache."""
+    if workspace:
+        user_data = _get_user_cache(client, workspace)
+        # Check username first, then display name
+        uid = user_data.get("name_to_id", {}).get(name)
+        if uid:
+            return uid
+        uid = user_data.get("display_to_id", {}).get(name)
+        if uid:
+            return uid
+
+    # Cache miss — fall back to paginating the API
     cursor = None
     while True:
         kwargs: dict = {"limit": 200}
@@ -788,11 +995,13 @@ def _format_ts(ts: str) -> str:
         return ts
 
 
-def _print_messages(client: WebClient, messages: list[dict]) -> None:
+def _print_messages(
+    client: WebClient, messages: list[dict], workspace: str = ""
+) -> None:
     """Render a list of Slack messages to the console."""
     for msg in messages:
         user_id = msg.get("user", "")
-        username = resolve_user(client, user_id) if user_id else "bot"
+        username = resolve_user(client, user_id, workspace=workspace) if user_id else "bot"
         text = msg.get("text", "")
         ts = msg.get("ts", "")
         ts_display = _format_ts(ts)
