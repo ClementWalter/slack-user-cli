@@ -1584,6 +1584,13 @@ def upload(
     default=False,
     help="Resolve user IDs to display names when reading. Default emits raw IDs.",
 )
+@click.option(
+    "--expand-thread",
+    is_flag=True,
+    default=False,
+    help="When reading, also fetch replies for every threaded message and "
+    "attach them inline under `replies`. Only meaningful with --json.",
+)
 @click.pass_context
 def dm(
     ctx: click.Context,
@@ -1593,6 +1600,7 @@ def dm(
     thread_ts: str | None,
     as_json: bool,
     with_names: bool,
+    expand_thread: bool,
 ) -> None:
     """Open a DM with a user. Send a message or read recent history."""
     client = get_client(workspace=ctx.obj["workspace"])
@@ -1639,6 +1647,11 @@ def dm(
         except SlackApiError as exc:
             raise click.ClickException(str(exc)) from exc
         messages = list(reversed(hist.get("messages", [])))
+        if as_json and expand_thread:
+            for msg in messages:
+                ts = msg.get("ts", "")
+                if msg.get("thread_ts") and msg.get("reply_count", 0) and ts:
+                    msg["_replies"] = _fetch_thread_replies(client, dm_channel, ts)
         if as_json:
             _emit_messages_json(
                 client, dm_channel, messages, workspace=ws, with_names=with_names
