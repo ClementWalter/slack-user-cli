@@ -1070,9 +1070,9 @@ def read(
     messages.reverse()
 
     # Expand threads *before* emitting. We stash replies on the message dict
-    # itself so _emit_messages_json can serialize them alongside the parent;
-    # the key is underscore-prefixed to avoid clashing with any Slack field.
-    if as_json and expand_thread:
+    # itself so both renderers can access them alongside the parent; the key
+    # is underscore-prefixed to avoid clashing with any Slack field.
+    if expand_thread:
         for msg in messages:
             ts = msg.get("ts", "")
             if msg.get("thread_ts") and msg.get("reply_count", 0) and ts:
@@ -1647,7 +1647,7 @@ def dm(
         except SlackApiError as exc:
             raise click.ClickException(str(exc)) from exc
         messages = list(reversed(hist.get("messages", [])))
-        if as_json and expand_thread:
+        if expand_thread:
             for msg in messages:
                 ts = msg.get("ts", "")
                 if msg.get("thread_ts") and msg.get("reply_count", 0) and ts:
@@ -2032,12 +2032,14 @@ def _print_messages(
     messages: list[dict],
     workspace: str = "",
     with_names: bool = False,
+    indent: str = "",
 ) -> None:
     """Render a list of Slack messages to the console.
 
     Default shows raw user IDs (and leaves <@UXXX> mention tokens untouched)
     so output is stable for scripts. Pass `with_names=True` to resolve to
-    display names.
+    display names. Replies stashed under `_replies` (by --expand-thread) are
+    rendered indented beneath their parent.
     """
     for msg in messages:
         user_id = msg.get("user", "")
@@ -2056,7 +2058,7 @@ def _print_messages(
         thread_ts = msg.get("thread_ts")
         reply_count = msg.get("reply_count", 0)
 
-        line = Text()
+        line = Text(indent)
         line.append(f"[{ts_display}] ", style="dim")
         line.append(f"{username}: ", style="bold")
         line.append(text)
@@ -2064,6 +2066,16 @@ def _print_messages(
         if thread_ts and reply_count:
             line.append(f" [{reply_count} replies]", style="yellow")
         console.print(line)
+
+        replies = msg.get("_replies") or []
+        if replies:
+            _print_messages(
+                client,
+                replies,
+                workspace=workspace,
+                with_names=with_names,
+                indent=indent + "  ↳ ",
+            )
 
 
 # Matches Slack user-mention tokens. Slack emits either `<@U0123>` when the
