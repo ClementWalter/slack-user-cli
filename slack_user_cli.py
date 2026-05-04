@@ -1506,6 +1506,325 @@ def send(
         console.print(f"[green]Message sent[/] (ts={ts})")
 
 
+# -- click (block-kit interactive) -------------------------------------------
+
+
+def _fetch_message(client: WebClient, channel: str, message_ts: str) -> dict:
+    """Fetch a single message by exact ts.
+
+    `inclusive=True` plus latest=oldest=ts returns just that one message.
+    Slack only provides this lookup via conversations_history — there is no
+    direct `messages.get` endpoint.
+    """
+    resp = client.conversations_history(
+        channel=channel,
+        latest=message_ts,
+        oldest=message_ts,
+        inclusive=True,
+        limit=1,
+    )
+    msgs = resp.get("messages", []) or []
+    if not msgs:
+        raise click.ClickException(
+            f"No message found at ts={message_ts} in channel {channel}."
+        )
+    return msgs[0]
+
+
+def _select_action_element(
+    msg: dict,
+    option_text: str | None,
+    option_index: int | None,
+    action_id: str | None,
+    value: str | None,
+) -> tuple[dict, dict, dict | None]:
+    """Locate the action element + (for radio/select) the chosen option.
+
+    Returns (block, element, option_or_none). Lookup precedence is the most
+    specific identifier first (action_id / value), then visible text, then
+    1-based index across all action elements in the message.
+    """
+    candidates: list[tuple[dict, dict]] = []
+    for block in msg.get("blocks", []) or []:
+        if block.get("type") != "actions":
+            continue
+        for el in block.get("elements", []) or []:
+            candidates.append((block, el))
+
+    if not candidates:
+        raise click.ClickException("Message has no actions block to click.")
+
+    # 1. exact action_id wins
+    if action_id:
+        for block, el in candidates:
+            if el.get("action_id") == action_id:
+                # Match an option inside the element if given, otherwise None
+                opt = _match_option(el, option_text=option_text, value=value)
+                return block, el, opt
+        raise click.ClickException(f"action_id {action_id!r} not found on message.")
+
+    # 2. exact value matches a button.value or a radio/select option.value
+    if value:
+        for block, el in candidates:
+            if el.get("type") == "button" and el.get("value") == value:
+                return block, el, None
+            opt = _match_option(el, value=value)
+            if opt:
+                return block, el, opt
+        raise click.ClickException(f"value {value!r} not found on message.")
+
+    # 3. visible text — match a button label or a radio/select option label
+    if option_text:
+        for block, el in candidates:
+            if el.get("type") == "button" and (el.get("text") or {}).get("text") == option_text:
+                return block, el, None
+            opt = _match_option(el, option_text=option_text)
+            if opt:
+                return block, el, opt
+        raise click.ClickException(
+            f"Option text {option_text!r} not found. "
+            "Use `read --json` to see available labels."
+        )
+
+    # 4. fallback to 1-based index across all action elements
+    if option_index is not None:
+        if option_index < 1 or option_index > len(candidates):
+            raise click.ClickException(
+                f"--index {option_index} out of range (1..{len(candidates)})."
+            )
+        block, el = candidates[option_index - 1]
+        return block, el, None
+
+    raise click.ClickException(
+        "Specify which option to click via --option, --index, --action-id, or --value."
+    )
+
+
+def _match_option(el: dict, option_text: str | None = None, value: str | None = None) -> dict | None:
+    """Return the radio/select option matching either label or value."""
+    if el.get("type") not in ("radio_buttons", "static_select", "checkboxes"):
+        return None
+    for o in el.get("options", []) or []:
+        if value is not None and o.get("value") == value:
+            return o
+        if option_text is not None and (o.get("text") or {}).get("text") == option_text:
+            return o
+    return None
+
+
+def _build_action_payload(el: dict, block_id: str, option: dict | None) -> tuple[list[dict], dict]:
+    """Build (`actions`, `state`) JSON values for the blocks.actions form.
+
+    Captured from a real Slack web client request: `actions` is a list with
+    one entry describing the click; `state` mirrors the chosen value back so
+    Slack can pass it through to the receiving app's interactive handler.
+    Buttons skip the state mirror (no persistent selection to remember).
+    """
+    el_type = el["type"]
+    action_id = el["action_id"]
+
+    if el_type == "button":
+        action_entry = {
+            "action_id": action_id,
+            "block_id": block_id,
+            "text": el.get("text") or {"type": "plain_text", "text": ""},
+            "value": el.get("value", ""),
+            "type": "button",
+            "action_ts": f"{time.time():.6f}",
+        }
+        # Slack still expects a state object even when empty.
+        state = {"values": {}}
+        return [action_entry], state
+
+    if el_type in ("radio_buttons", "static_select"):
+        if not option:
+            raise click.ClickException(
+                f"{el_type} requires an option (use --option, --value, or --action-id with one of those)."
+            )
+        action_entry = {
+            "action_id": action_id,
+            "block_id": block_id,
+            "selected_option": option,
+            "type": el_type,
+            "action_ts": f"{time.time():.6f}",
+        }
+        state = {
+            "values": {
+                block_id: {
+                    action_id: {
+                        "type": el_type,
+                        "selected_option": option,
+                    }
+                }
+            }
+        }
+        return [action_entry], state
+
+    raise click.ClickException(
+        f"Unsupported action element type {el_type!r}. "
+        "Add support by extending _build_action_payload."
+    )
+
+
+def _dispatch_block_action(
+    config: dict,
+    workspace_name: str,
+    channel_id: str,
+    msg: dict,
+    actions_payload: list[dict],
+    state: dict,
+    client: WebClient,
+) -> dict:
+    """POST to /api/blocks.actions exactly the way the Slack web client does.
+
+    This is an internal Slack endpoint (not in the public Web API). The
+    multipart form shape was reverse-engineered from a real button click
+    captured in DevTools. `_x_*` fields are tracking metadata Slack tags on
+    every request — included so the request looks indistinguishable from a
+    browser dispatch.
+    """
+    import requests  # noqa: PLC0415 — local import keeps top-level deps narrow
+
+    ws_cfg = config.get("workspaces", {}).get(workspace_name, {})
+    token = ws_cfg.get("token", "")
+    cookie = config.get("cookie", "")
+    if not token or not cookie:
+        raise click.ClickException("Not logged in. Run 'login' first.")
+
+    # `service_team_id` must be the Slack team ID (e.g. TFM7VTADR), not the
+    # workspace slug stored in our config. auth.test is the canonical source.
+    auth = client.auth_test().data
+    team_id = auth.get("team_id", "")
+
+    bot_id = msg.get("bot_id", "")
+    app_id = msg.get("app_id", "")
+    if not bot_id or not app_id:
+        raise click.ClickException(
+            "Message has no bot_id/app_id — only bot messages with block kit are clickable."
+        )
+
+    container = {
+        "type": "message",
+        "message_ts": msg["ts"],
+        "channel_id": channel_id,
+        "is_ephemeral": bool(msg.get("subtype") == "ephemeral"),
+    }
+
+    form = {
+        "token": token,
+        "service_id": bot_id,
+        "app_id": app_id,
+        "service_team_id": team_id,
+        "actions": json.dumps(actions_payload, ensure_ascii=False),
+        "container": json.dumps(container, ensure_ascii=False),
+        "client_token": f"web-{int(time.time() * 1000)}",
+        "state": json.dumps(state, ensure_ascii=False),
+        "_x_reason": "dispatch_action_to_developer",
+        "_x_mode": "online",
+        "_x_sonic": "true",
+        "_x_app_name": "client",
+    }
+
+    # Multipart body without any files: requests' `files=` accepts (name, value)
+    # tuples as form fields when value is `(None, str)`.
+    multipart = {k: (None, v) for k, v in form.items()}
+
+    url = f"https://slack.com/api/blocks.actions?slack_route={team_id}"
+    headers = {"Cookie": f"d={cookie}"}
+    r = requests.post(url, files=multipart, headers=headers, timeout=20)
+    try:
+        return r.json()
+    except ValueError as exc:
+        raise click.ClickException(
+            f"Non-JSON response from blocks.actions: {r.status_code} {r.text[:200]}"
+        ) from exc
+
+
+@cli.command(name="click")
+@click.argument("channel")
+@click.argument("message_ts")
+@click.option(
+    "--option",
+    "option_text",
+    default=None,
+    help="Pick by visible button/option label (e.g. 'A few seconds').",
+)
+@click.option(
+    "--index",
+    "option_index",
+    type=int,
+    default=None,
+    help="Pick by 1-based index across all action elements in the message.",
+)
+@click.option(
+    "--action-id",
+    default=None,
+    help="Pick by exact action_id (precise; pair with --option/--value for radios).",
+)
+@click.option(
+    "--value",
+    default=None,
+    help="Pick by exact button.value or radio/select option.value.",
+)
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    default=False,
+    help="Emit structured JSON.",
+)
+@click.pass_context
+def click_cmd(
+    ctx: click.Context,
+    channel: str,
+    message_ts: str,
+    option_text: str | None,
+    option_index: int | None,
+    action_id: str | None,
+    value: str | None,
+    as_json: bool,
+) -> None:
+    """Click a block-kit button or pick a radio option on a bot message.
+
+    Use `read --json` to see available action_ids, button labels and option
+    values on the target message. Pass either `--option`, `--index`,
+    `--action-id`, or `--value` to identify which control to fire.
+    """
+    config = load_config()
+    workspace_name = ctx.obj["workspace_name"]
+    client = get_client(config=config, workspace=ctx.obj["workspace"])
+    channel_id = resolve_channel(client, channel, workspace=workspace_name)
+    msg = _fetch_message(client, channel_id, message_ts)
+    block, el, option = _select_action_element(
+        msg,
+        option_text=option_text,
+        option_index=option_index,
+        action_id=action_id,
+        value=value,
+    )
+    actions_payload, state = _build_action_payload(el, block["block_id"], option)
+    resp = _dispatch_block_action(
+        config=config,
+        workspace_name=workspace_name,
+        channel_id=channel_id,
+        msg=msg,
+        actions_payload=actions_payload,
+        state=state,
+        client=client,
+    )
+    if as_json:
+        click.echo(json.dumps(resp, ensure_ascii=False))
+    else:
+        if resp.get("ok"):
+            label = (
+                option["text"]["text"] if option else (el.get("text") or {}).get("text", el["action_id"])
+            )
+            console.print(f"[green]Clicked[/]: {label!r} on ts={message_ts}")
+        else:
+            console.print(f"[red]Click failed[/]: {resp}")
+            raise click.ClickException(resp.get("error", "unknown error"))
+
+
 # -- upload -------------------------------------------------------------------
 
 
@@ -2105,6 +2424,46 @@ def _resolve_mentions(
     return _USER_MENTION_RE.sub(sub, text)
 
 
+def _extract_actions(blocks: list[dict]) -> list[dict]:
+    """Pull clickable elements (buttons, radio_buttons, static_select) out of block-kit.
+
+    Returned shape is a flat list of dicts ready for use with the `click`
+    subcommand. Buttons surface as one entry; radio_buttons / static_select
+    surface as a single entry whose `options` lists every choice. Block IDs
+    and action IDs are kept verbatim because `blocks.actions` requires them
+    byte-for-byte.
+    """
+    out: list[dict] = []
+    for block in blocks or []:
+        if block.get("type") != "actions":
+            continue
+        block_id = block.get("block_id", "")
+        for el in block.get("elements", []) or []:
+            el_type = el.get("type", "")
+            entry: dict = {
+                "type": el_type,
+                "block_id": block_id,
+                "action_id": el.get("action_id", ""),
+            }
+            if el_type == "button":
+                entry["text"] = (el.get("text") or {}).get("text", "")
+                entry["value"] = el.get("value", "")
+            elif el_type in ("radio_buttons", "static_select", "checkboxes"):
+                entry["options"] = [
+                    {
+                        "text": (o.get("text") or {}).get("text", ""),
+                        "value": o.get("value", ""),
+                    }
+                    for o in el.get("options", []) or []
+                ]
+            else:
+                # Unknown action type — keep raw element so a caller can still
+                # construct a payload for it instead of dropping the choice.
+                entry["raw"] = el
+            out.append(entry)
+    return out
+
+
 def _message_to_entry(
     client: WebClient,
     msg: dict,
@@ -2135,6 +2494,18 @@ def _message_to_entry(
     reply_count = msg.get("reply_count", 0)
     if msg.get("thread_ts") and reply_count:
         entry["threadCount"] = reply_count
+    actions = _extract_actions(msg.get("blocks", []) or [])
+    if actions:
+        # Expose the raw ts so callers can pass it back to `click` without
+        # losing precision to the human-readable formatter above.
+        entry["raw_ts"] = msg.get("ts", "")
+        entry["actions"] = actions
+        bot_id = msg.get("bot_id")
+        app_id = msg.get("app_id")
+        if bot_id:
+            entry["bot_id"] = bot_id
+        if app_id:
+            entry["app_id"] = app_id
     replies = msg.get("_replies") or []
     if replies:
         entry["replies"] = [

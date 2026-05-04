@@ -153,6 +153,59 @@ slack_user_cli dm <user_name_or_id>
 slack_user_cli dm <user_name_or_id> --json
 ```
 
+### Clicking Block-Kit Buttons
+
+`read --json` surfaces interactive elements alongside the text. When a bot
+message has a block-kit `actions` block, the JSON entry gains an `actions`
+field plus a `raw_ts` field (the unformatted ts you pass to `click`):
+
+```json
+{
+  "ts": "2026-05-04 09:30",
+  "raw_ts": "1777887012.881539",
+  "user": "bot",
+  "text": "Which one is legit?",
+  "bot_id": "B095...",
+  "app_id": "A01G...",
+  "actions": [
+    {"type": "button", "block_id": "...", "action_id": "...", "text": "The first one!", "value": "..."},
+    {"type": "button", "block_id": "...", "action_id": "...", "text": "The second one!", "value": "..."}
+  ]
+}
+```
+
+`click` dispatches a button or radio choice via Slack's internal
+`blocks.actions` endpoint (the same call the web client makes when you click
+a button). It's how you complete training bots like Riot/Albert from the CLI.
+
+**Same approval rules as Writing above** — clicking a button on a message in a
+shared channel produces side effects visible to everyone. DMs to bots are
+fine without confirmation.
+
+```bash
+# Click by visible button label (most ergonomic)
+slack_user_cli click <channel> <raw_ts> --option "The first one!"
+
+# Pick a radio option by its label
+slack_user_cli click <channel> <raw_ts> --option "A few seconds"
+
+# Pick by 1-based index across all action elements on the message
+slack_user_cli click <channel> <raw_ts> --index 2
+
+# Pick by exact action_id (precise; needed if multiple buttons share text)
+slack_user_cli click <channel> <raw_ts> --action-id "WyIw..."
+
+# Pick by exact value (for buttons or radio options)
+slack_user_cli click <channel> <raw_ts> --value "WyJiY..."
+
+# JSON output with the raw blocks.actions response
+slack_user_cli click <channel> <raw_ts> --option "OK" --json
+```
+
+Supported element types: `button`, `radio_buttons`, `static_select`. Other
+types (datepickers, multi-selects, modals) raise an error explaining how to
+extend `_build_action_payload`.
+
 ### File Uploads
 
 **Same approval rules as Writing above** — uploading to a main channel (without
