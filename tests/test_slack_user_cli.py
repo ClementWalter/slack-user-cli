@@ -25,9 +25,13 @@ from slack_sdk.errors import SlackApiError
 
 from slack_user_cli import (
     _channel_type_label,
+    _collect_raw_files,
     _download_file,
     _extract_files,
+    _extract_links,
+    _extract_shared,
     _format_ts,
+    _link_parts,
     _load_cache,
     _message_to_entry,
     _parse_since,
@@ -1856,3 +1860,94 @@ class TestDownloadCommand:
             ["download", "C123", "1700000000.000000", "-o", str(out)],
         )
         assert (out / "q.pdf").read_bytes() == b"DATA"
+
+
+# -- quoted / shared message tests --------------------------------------------
+
+# A message that shares another message: the original (with its files) lands in
+# `attachments`, not in the top-level `files` field.
+SHARED_MSG = {
+    "ts": "1.0",
+    "user": "U1",
+    "text": "Forwarding this",
+    "attachments": [
+        {
+            "is_share": True,
+            "from_url": "https://x.slack.com/archives/C0SRC/p1780306198826489",
+            "author_name": "Genia Shipova",
+            "channel_id": "C0SRC",
+            "ts": "1780306198.826489",
+            "text": "here are the quotes",
+            "files": [{"id": "F1", "name": "quote.pdf", "url_private": "https://x/p"}],
+        }
+    ],
+}
+
+
+class TestExtractShared:
+    def test_surfaces_shared_files(self):
+        assert _extract_shared(SHARED_MSG)[0]["files"][0]["name"] == "quote.pdf"
+
+    def test_captures_source_url(self):
+        assert _extract_shared(SHARED_MSG)[0]["channel"] == "C0SRC"
+
+    def test_captures_author(self):
+        assert _extract_shared(SHARED_MSG)[0]["author"] == "Genia Shipova"
+
+    def test_ignores_plain_attachments(self):
+        msg = {"attachments": [{"title": "a link preview", "text": "no share here"}]}
+        assert _extract_shared(msg) == []
+
+    def test_empty_when_no_attachments(self):
+        assert _extract_shared({"text": "hi"}) == []
+
+
+class TestCollectRawFiles:
+    def test_includes_shared_message_files(self):
+        assert _collect_raw_files(SHARED_MSG)[0]["name"] == "quote.pdf"
+
+    def test_includes_direct_and_shared(self):
+        msg = {"files": [{"id": "D1", "name": "direct.pdf"}], **SHARED_MSG}
+        names = {f.get("name") for f in _collect_raw_files(msg)}
+        assert names == {"direct.pdf", "quote.pdf"}
+
+
+class TestExtractLinks:
+    def test_parses_permalink_from_text(self):
+        msg = {"text": "see <https://x.slack.com/archives/C9/p1700000000000000>"}
+        assert _extract_links(msg)[0]["channel"] == "C9"
+
+    def test_reinserts_ts_dot(self):
+        msg = {"text": "https://x.slack.com/archives/C9/p1700000000000000"}
+        assert _extract_links(msg)[0]["ts"] == "1700000000.000000"
+
+    def test_empty_when_no_link(self):
+        assert _extract_links({"text": "just words"}) == []
+
+
+class TestLinkParts:
+    def test_returns_none_for_non_permalink(self):
+        assert _link_parts("https://example.com/foo") is None
+
+
+class TestMessageToEntryShared:
+    def test_entry_includes_shared(self, mock_client):
+        entry = _message_to_entry(mock_client, SHARED_MSG, "", with_names=False)
+        assert entry["shared"][0]["files"][0]["name"] == "quote.pdf"
+
+
+class TestDownloadQuotedMessage:
+    @patch("requests.get")
+    @patch("slack_user_cli.get_client")
+    def test_download_fetches_shared_files(
+        self, mock_get_client, mock_get, runner, saved_config, tmp_path
+    ):
+        mock_client = MagicMock()
+        mock_client.conversations_replies.return_value = {
+            "messages": [{**SHARED_MSG, "ts": "1700000000.000000"}]
+        }
+        mock_get_client.return_value = mock_client
+        mock_get.return_value = MagicMock(content=b"PDF", raise_for_status=lambda: None)
+        out = tmp_path / "dl"
+        runner.invoke(cli, ["download", "C123", "1700000000.000000", "-o", str(out)])
+        assert (out / "quote.pdf").read_bytes() == b"PDF"

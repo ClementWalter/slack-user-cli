@@ -101,6 +101,11 @@ slack_user_cli read <channel_name_or_id> --limit 20
 # permalink}. In text output, attachments show as a 📎 line under the message.
 # To actually read a file's contents, fetch it with the `download` command
 # (the message text alone never includes attachment contents).
+# A message that QUOTES/SHARES another message carries the original under a
+# `shared` array: [{url, author, channel, ts, text, files:[...]}]. Its `files`
+# are the quoted message's attachments — so a forwarded message never hides its
+# attachments (text output shows them under a "↪ quoted <author>" line). Plain
+# pasted message permalinks appear in a `links` array ([{url, channel, ts}]).
 slack_user_cli read <channel_name_or_id> --limit 20 --json
 
 # Add --expand-thread to inline every thread's replies under `replies: [...]`
@@ -279,6 +284,11 @@ slack_user_cli download <channel_name_or_id> <raw_ts> -o ./out --json
 Default output directory is `./slack-downloads`. Downloaded files can then be
 read with normal file tools (e.g. a PDF reader). Reading another workspace's
 files is gated by your own access — `download` uses the same session auth.
+
+`download` also fetches attachments from a **quoted/shared** message: if you
+point it at a message that forwards another one (the original shows up under
+`shared` in JSON / a "↪ quoted" line in text), it pulls the original's files
+too — so you don't have to chase the source message manually.
 
 ### Important: DM User Name Resolution
 
