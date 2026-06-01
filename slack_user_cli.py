@@ -1278,6 +1278,125 @@ def url_command(
         _print_messages(client, replies, workspace=ws, with_names=with_names)
 
 
+# -- download -----------------------------------------------------------------
+
+
+@cli.command()
+@click.argument("target")
+@click.argument("ts", required=False)
+@click.option(
+    "--output",
+    "-o",
+    "output",
+    default="slack-downloads",
+    help="Directory to save files into (default: ./slack-downloads).",
+)
+@click.option(
+    "--list",
+    "list_only",
+    is_flag=True,
+    default=False,
+    help="List attachments without downloading them.",
+)
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    default=False,
+    help="Emit structured JSON ({files: [...], downloaded: [...]}).",
+)
+@click.pass_context
+def download(
+    ctx: click.Context,
+    target: str,
+    ts: str | None,
+    output: str,
+    list_only: bool,
+    as_json: bool,
+) -> None:
+    """Download file attachments from a message (or a file ID).
+
+    TARGET may be a Slack permalink, a channel name/ID (then pass TS), or a
+    file ID (starts with F). Files are saved into --output. Use --list to only
+    enumerate the attachments. The plain `read`/`url`/`thread` commands also
+    now surface a `files` array (JSON) and a 📎 line (text) so you can spot
+    attachments before fetching them.
+    """
+    client = get_client(workspace=ctx.obj["workspace"])
+    ws = ctx.obj["workspace_name"]
+
+    files: list[dict] = []
+    if ts is None and re.fullmatch(r"F[A-Z0-9]+", target):
+        # A bare file ID — resolve it directly via files.info.
+        try:
+            resp = client.api_call("files.info", params={"file": target})
+        except SlackApiError as exc:
+            raise click.ClickException(str(exc)) from exc
+        file_obj = resp.get("file") or {}
+        if file_obj:
+            files = [file_obj]
+    else:
+        # A permalink, or a channel + ts pair.
+        if "slack.com/archives/" in target:
+            _ws, channel_id, message_ts = parse_slack_url(target)
+        else:
+            if not ts:
+                raise click.ClickException(
+                    "Provide a message TS after the channel, or pass a Slack "
+                    "permalink / a file ID (starts with F)."
+                )
+            channel_id = resolve_channel(client, target, workspace=ws)
+            message_ts = ts
+        try:
+            resp = client.conversations_replies(
+                channel=channel_id, ts=message_ts, limit=50
+            )
+        except SlackApiError as exc:
+            raise click.ClickException(str(exc)) from exc
+        msgs = resp.get("messages", [])
+        # Prefer the exact message; fall back to scanning the thread so a
+        # root-ts that returns its whole thread still yields its own files.
+        match = next((m for m in msgs if m.get("ts") == message_ts), None)
+        for m in [match] if match else msgs:
+            files.extend((m or {}).get("files", []) or [])
+
+    listing = _extract_files({"files": files})
+    if not listing:
+        if as_json:
+            click.echo(json.dumps({"files": [], "downloaded": []}))
+        else:
+            console.print("[yellow]No file attachments found.[/]")
+        return
+
+    if list_only:
+        if as_json:
+            click.echo(json.dumps({"files": listing}, ensure_ascii=False))
+        else:
+            for f in listing:
+                kind = f["filetype"] or f["mimetype"] or "file"
+                size = f", {f['size']} bytes" if f.get("size") else ""
+                # Build with Text so the metadata isn't parsed as Rich markup
+                # (bare square brackets would be swallowed as style tags).
+                fl = Text("📎 ", style="cyan")
+                fl.append(f["name"], style="cyan")
+                fl.append(f" ({kind}{size})", style="dim")
+                fl.append(f"  id={f['id']}", style="dim")
+                console.print(fl)
+        return
+
+    dest = Path(output)
+    saved: list[str] = []
+    for f in files:
+        path = _download_file(client, f, dest)
+        saved.append(str(path))
+        if not as_json:
+            console.print(f"[green]saved[/] {path} ({len(path.read_bytes())} bytes)")
+    if as_json:
+        click.echo(
+            json.dumps({"files": listing, "downloaded": saved}, ensure_ascii=False)
+        )
+
+
 # -- permalink ----------------------------------------------------------------
 
 
@@ -2472,6 +2591,21 @@ def _print_messages(
             line.append(f" [{reply_count} replies]", style="yellow")
         console.print(line)
 
+        # Surface attachments so a reader knows files exist (and can fetch them
+        # with the `download` command); they're otherwise invisible in text.
+        for f in _extract_files(msg):
+            meta = f.get("filetype") or f.get("mimetype") or ""
+            if f.get("size"):
+                meta = f"{meta}, {f['size']} bytes" if meta else f"{f['size']} bytes"
+            fl = Text(indent + "  ")
+            fl.append("📎 ", style="cyan")
+            fl.append(f["name"], style="cyan")
+            if meta:
+                fl.append(f" ({meta})", style="dim")
+            if f.get("id"):
+                fl.append(f"  id={f['id']}", style="dim")
+            console.print(fl)
+
         replies = msg.get("_replies") or []
         if replies:
             _print_messages(
@@ -2550,6 +2684,62 @@ def _extract_actions(blocks: list[dict]) -> list[dict]:
     return out
 
 
+def _extract_files(msg: dict) -> list[dict]:
+    """Pull a clean attachment list out of a message's `files` array.
+
+    Slack hangs uploaded files (PDFs, images, docs, snippets) off the message
+    `files` field. Each entry keeps the file ID, a usable filename, type/size,
+    and the `url_private*` endpoints the `download` command needs to fetch the
+    bytes. Deleted or access-limited files may lack a download URL; they're
+    still listed so the caller knows an attachment was there.
+    """
+    out: list[dict] = []
+    for f in msg.get("files", []) or []:
+        out.append(
+            {
+                "id": f.get("id", ""),
+                "name": f.get("name") or f.get("title") or f.get("id", "file"),
+                "title": f.get("title", ""),
+                "filetype": f.get("filetype", ""),
+                "mimetype": f.get("mimetype", ""),
+                "size": f.get("size"),
+                "url_private": f.get("url_private", ""),
+                "url_private_download": f.get("url_private_download", ""),
+                "permalink": f.get("permalink", ""),
+            }
+        )
+    return out
+
+
+def _download_file(client: WebClient, file_info: dict, dest_dir: Path) -> Path:
+    """Download one Slack file into dest_dir using the client's auth.
+
+    File bytes are gated behind `url_private`; the browser-session auth the
+    WebClient already carries (xoxc token + d cookie) is exactly what unlocks
+    them, so we reuse those headers rather than an unauthenticated request.
+    The filename is reduced to its basename to avoid path traversal from a
+    Slack-supplied name.
+    """
+    import requests  # noqa: PLC0415
+
+    url = file_info.get("url_private_download") or file_info.get("url_private")
+    if not url:
+        raise click.ClickException(
+            f"File {file_info.get('id', '?')} has no downloadable URL "
+            "(it may be deleted or an external link)."
+        )
+    headers = dict(client.headers or {})
+    headers["Authorization"] = f"Bearer {client.token}"
+    resp = requests.get(url, headers=headers, timeout=60)
+    resp.raise_for_status()
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    name = file_info.get("name") or file_info.get("title") or file_info.get("id", "file")
+    path = dest_dir / Path(name).name
+    path.write_bytes(resp.content)
+    return path
+
+
 def _message_to_entry(
     client: WebClient,
     msg: dict,
@@ -2598,6 +2788,13 @@ def _message_to_entry(
             entry["bot_id"] = bot_id
         if app_id:
             entry["app_id"] = app_id
+    # Surface uploaded attachments (PDFs, images, docs). Without this a JSON
+    # consumer can't even tell a message carries files, let alone fetch them;
+    # the entries here include the IDs and private URLs the `download` command
+    # needs.
+    files = _extract_files(msg)
+    if files:
+        entry["files"] = files
     replies = msg.get("_replies") or []
     if replies:
         entry["replies"] = [

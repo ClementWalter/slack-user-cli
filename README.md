@@ -83,6 +83,10 @@ slack_user_cli thread <channel> <message_ts>
 slack_user_cli url "https://workspace.slack.com/archives/C.../p..."
 slack_user_cli search "query in:#channel" --count 20
 
+# Download file attachments (PDFs, images, docs) from a message
+slack_user_cli download "https://workspace.slack.com/archives/C.../p..." -o ./out
+slack_user_cli download <channel> <message_ts> --list
+
 # Write
 slack_user_cli send <channel> "message text"
 slack_user_cli send <channel> "reply" --thread <message_ts>

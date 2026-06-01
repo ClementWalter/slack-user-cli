@@ -91,11 +91,16 @@ slack_user_cli read <channel_name_or_id> --limit 20
 
 # Emit structured JSON instead of human-readable text (for programmatic
 # consumers — smithers workflows, scripts, pipelines). Shape:
-#   {"channel": "...", "messages": [{"ts", "raw_ts", "user", "text", "thread_ts"?, "threadCount"?, "replies"?}, ...]}
+#   {"channel": "...", "messages": [{"ts", "raw_ts", "user", "text", "thread_ts"?, "threadCount"?, "files"?, "replies"?}, ...]}
 # Every message carries `raw_ts` (full microsecond ts) — `ts` is minute-precision
 # for humans, but `raw_ts` is what you pass to the `permalink`/`click`/`thread`
 # commands. Use --json whenever you'd otherwise parse the pretty output back into
 # fields — the parse step is the #1 source of bugs and timeouts.
+# Messages with attachments carry a `files` array: each entry has
+# {id, name, filetype, mimetype, size, url_private, url_private_download,
+# permalink}. In text output, attachments show as a 📎 line under the message.
+# To actually read a file's contents, fetch it with the `download` command
+# (the message text alone never includes attachment contents).
 slack_user_cli read <channel_name_or_id> --limit 20 --json
 
 # Add --expand-thread to inline every thread's replies under `replies: [...]`
@@ -245,6 +250,35 @@ slack_user_cli dm-upload <user_name_or_id> /path/to/file.png
 # DM upload with message and in a thread
 slack_user_cli dm-upload <user_name_or_id> /path/to/file.png --message "See attached" --thread <message_ts>
 ```
+
+### Downloading File Attachments
+
+Messages often carry uploaded files (PDFs, images, docs). The message **text**
+never contains the file contents, so to read an attachment you must download it.
+`read`/`url`/`thread --json` expose a `files` array (and text output shows a 📎
+line) so you can spot attachments; `download` fetches the bytes locally.
+
+```bash
+# Download every attachment on a message — pass a permalink…
+slack_user_cli download "https://workspace.slack.com/archives/C.../p..." -o ./out
+
+# …or a channel + message raw_ts
+slack_user_cli download <channel_name_or_id> <raw_ts> -o ./out
+
+# …or a single file by its ID (starts with F)
+slack_user_cli download F0B883G50V6 -o ./out
+
+# Just list the attachments (name, type, size, id) without downloading
+slack_user_cli download <channel_name_or_id> <raw_ts> --list
+slack_user_cli download <channel_name_or_id> <raw_ts> --list --json
+
+# JSON: {"files": [...], "downloaded": ["./out/quote.pdf", ...]}
+slack_user_cli download <channel_name_or_id> <raw_ts> -o ./out --json
+```
+
+Default output directory is `./slack-downloads`. Downloaded files can then be
+read with normal file tools (e.g. a PDF reader). Reading another workspace's
+files is gated by your own access — `download` uses the same session auth.
 
 ### Important: DM User Name Resolution
 
