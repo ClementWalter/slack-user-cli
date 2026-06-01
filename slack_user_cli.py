@@ -1357,8 +1357,11 @@ def download(
         # Prefer the exact message; fall back to scanning the thread so a
         # root-ts that returns its whole thread still yields its own files.
         match = next((m for m in msgs if m.get("ts") == message_ts), None)
+        # _collect_raw_files pulls direct uploads *and* files from a quoted /
+        # shared message, so downloading a message that forwards another still
+        # fetches the original's attachments.
         for m in [match] if match else msgs:
-            files.extend((m or {}).get("files", []) or [])
+            files.extend(_collect_raw_files(m or {}))
 
     listing = _extract_files({"files": files})
     if not listing:
@@ -2606,6 +2609,34 @@ def _print_messages(
                 fl.append(f"  id={f['id']}", style="dim")
             console.print(fl)
 
+        # Surface quoted/shared messages and their attachments, so a message
+        # that forwards another one doesn't hide the original's files.
+        for sh in _extract_shared(msg):
+            who = sh.get("author") or "shared message"
+            sl = Text(indent + "  ↪ quoted ")
+            sl.append(who, style="magenta")
+            if sh.get("url"):
+                sl.append(f" {sh['url']}", style="dim")
+            console.print(sl)
+            for f in sh.get("files", []) or []:
+                meta = f.get("filetype") or f.get("mimetype") or ""
+                if f.get("size"):
+                    meta = f"{meta}, {f['size']} bytes" if meta else f"{f['size']} bytes"
+                fl = Text(indent + "    ")
+                fl.append("📎 ", style="cyan")
+                fl.append(f["name"], style="cyan")
+                if meta:
+                    fl.append(f" ({meta})", style="dim")
+                if f.get("id"):
+                    fl.append(f"  id={f['id']}", style="dim")
+                console.print(fl)
+
+        # Plain pasted permalinks to other messages.
+        for link in _extract_links(msg):
+            ll = Text(indent + "  🔗 ")
+            ll.append(link["url"], style="blue")
+            console.print(ll)
+
         replies = msg.get("_replies") or []
         if replies:
             _print_messages(
@@ -2711,6 +2742,88 @@ def _extract_files(msg: dict) -> list[dict]:
     return out
 
 
+# Matches a Slack message permalink in text or an attachment's from_url:
+# https://<workspace>.slack.com/archives/<channel>/p<16-digit-ts>
+_SLACK_MSG_LINK_RE = re.compile(
+    r"https?://[a-z0-9.\-]+\.slack\.com/archives/([CDG][A-Z0-9]+)/p(\d{16})"
+)
+
+
+def _link_parts(url: str) -> dict | None:
+    """Turn a Slack message permalink into {url, channel, ts}, or None.
+
+    The `p<digits>` form encodes the ts without its dot; we re-insert it so the
+    result is ready for `conversations.replies`, `download`, or `url`.
+    """
+    m = _SLACK_MSG_LINK_RE.search(url)
+    if not m:
+        return None
+    raw = m.group(2)
+    return {"url": url, "channel": m.group(1), "ts": f"{raw[:-6]}.{raw[-6:]}"}
+
+
+def _extract_shared(msg: dict) -> list[dict]:
+    """Surface messages quoted/shared into this one via Slack's "share message".
+
+    When someone shares another message into a channel, Slack stores the
+    original inside `attachments` (with `is_share`/`from_url`) — and copies the
+    original's `files` array there too. Reading only `msg["files"]` therefore
+    misses the attachments of a quoted message entirely. Each returned entry
+    identifies the source (url/author/channel/ts) and carries its files so they
+    are never silently dropped.
+    """
+    out: list[dict] = []
+    for a in msg.get("attachments", []) or []:
+        from_url = a.get("from_url")
+        if not (a.get("is_share") or a.get("is_msg_unfurl") or from_url):
+            continue
+        out.append(
+            {
+                "url": from_url or "",
+                "author": a.get("author_name", ""),
+                "channel": a.get("channel_id", ""),
+                "ts": a.get("ts", ""),
+                "text": a.get("text", ""),
+                "files": _extract_files(a),
+            }
+        )
+    return out
+
+
+def _extract_links(msg: dict) -> list[dict]:
+    """Pull Slack message permalinks pasted into a message's text.
+
+    Distinct from `_extract_shared` (Slack's native share/unfurl): this catches
+    a plain pasted `<https://…/archives/…/p…>` link so a reference to another
+    message — and any attachments it holds — stays visible and fetchable even
+    when Slack didn't unfurl it.
+    """
+    seen: set[str] = set()
+    out: list[dict] = []
+    for m in _SLACK_MSG_LINK_RE.finditer(msg.get("text", "") or ""):
+        url = m.group(0)
+        if url in seen:
+            continue
+        seen.add(url)
+        parts = _link_parts(url)
+        if parts:
+            out.append(parts)
+    return out
+
+
+def _collect_raw_files(msg: dict) -> list[dict]:
+    """Every downloadable file on a message: direct uploads + shared-message files.
+
+    `download` uses this so fetching a message that *quotes* another message
+    still retrieves the quoted message's attachments (they live under
+    `attachments[].files`, not `msg["files"]`).
+    """
+    files = list(msg.get("files", []) or [])
+    for a in msg.get("attachments", []) or []:
+        files.extend(a.get("files", []) or [])
+    return files
+
+
 def _download_file(client: WebClient, file_info: dict, dest_dir: Path) -> Path:
     """Download one Slack file into dest_dir using the client's auth.
 
@@ -2795,6 +2908,16 @@ def _message_to_entry(
     files = _extract_files(msg)
     if files:
         entry["files"] = files
+    # Messages that quote/share another message carry the original (and its
+    # files) under `attachments`; surface them so a quoted message's
+    # attachments are never missed.
+    shared = _extract_shared(msg)
+    if shared:
+        entry["shared"] = shared
+    # Plain pasted Slack permalinks referencing other messages.
+    links = _extract_links(msg)
+    if links:
+        entry["links"] = links
     replies = msg.get("_replies") or []
     if replies:
         entry["replies"] = [
