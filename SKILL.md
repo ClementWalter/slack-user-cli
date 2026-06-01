@@ -91,9 +91,11 @@ slack_user_cli read <channel_name_or_id> --limit 20
 
 # Emit structured JSON instead of human-readable text (for programmatic
 # consumers — smithers workflows, scripts, pipelines). Shape:
-#   {"channel": "...", "messages": [{"ts", "user", "text", "threadCount"?, "replies"?}, ...]}
-# Use this whenever you would otherwise have to parse the pretty output back
-# into fields — the parse step is the #1 source of bugs and timeouts.
+#   {"channel": "...", "messages": [{"ts", "raw_ts", "user", "text", "thread_ts"?, "threadCount"?, "replies"?}, ...]}
+# Every message carries `raw_ts` (full microsecond ts) — `ts` is minute-precision
+# for humans, but `raw_ts` is what you pass to the `permalink`/`click`/`thread`
+# commands. Use --json whenever you'd otherwise parse the pretty output back into
+# fields — the parse step is the #1 source of bugs and timeouts.
 slack_user_cli read <channel_name_or_id> --limit 20 --json
 
 # Add --expand-thread to inline every thread's replies under `replies: [...]`
@@ -101,6 +103,14 @@ slack_user_cli read <channel_name_or_id> --limit 20 --json
 # rather than parent posts, so expansion is almost always what you want for
 # analysis; skip it only when you need cheap channel-level metadata.
 slack_user_cli read <channel_name_or_id> --limit 20 --json --expand-thread
+
+# Time-bounded fetch: only messages at/after an ISO date or datetime (UTC if
+# no tz). Sets the history `oldest` bound; pair with a larger --limit to pull a
+# whole window. To catch threads whose parent predates the window but that got
+# fresh replies inside it, set --since a couple of days earlier, --expand-thread,
+# and filter on each message's raw_ts >= your real cutoff.
+slack_user_cli read <channel_name_or_id> --since 2026-05-29 --limit 200 --json --expand-thread
+slack_user_cli read <channel_name_or_id> --since 2026-05-29T10:07:00 --limit 200 --json
 
 # Read thread replies (use --dm when CHANNEL is a user name, not a channel)
 slack_user_cli thread <channel_name_or_id> <message_ts>
@@ -110,6 +120,13 @@ slack_user_cli thread --dm <user_name_or_id> <message_ts>
 # Read a thread directly from a Slack permalink URL
 slack_user_cli url "https://workspace.slack.com/archives/C.../p..."
 slack_user_cli url "https://workspace.slack.com/archives/C.../p..." --json
+
+# Canonical permalink(s) via chat.getPermalink — pass the channel + one or more
+# raw_ts. Unlike a hand-built /p<ts> URL, these are thread-aware (carry
+# thread_ts/cid) so they navigate correctly to threaded replies, not just roots.
+# ALWAYS use this to cite a message rather than constructing /p<ts> by hand.
+slack_user_cli permalink <channel_name_or_id> <raw_ts> [<raw_ts> ...]
+slack_user_cli permalink <channel_name_or_id> <raw_ts> --json   # {channel, permalinks: {ts: url}}
 
 # List workspace members (output: user IDs)
 slack_user_cli users
@@ -157,7 +174,8 @@ slack_user_cli dm <user_name_or_id> --json
 
 `read --json` surfaces interactive elements alongside the text. When a bot
 message has a block-kit `actions` block, the JSON entry gains an `actions`
-field plus a `raw_ts` field (the unformatted ts you pass to `click`):
+field. The `raw_ts` field (the unformatted ts you pass to `click`) is present
+on **every** message, not just block-kit ones:
 
 ```json
 {
@@ -333,34 +351,33 @@ Feb 27"), follow this procedure:
 ### 2. Read channel messages from the start date
 
 ```bash
-slack_user_cli read <channel_id> --limit 100
+# --since bounds the fetch server-side; --expand-thread inlines replies, and
+# --json gives you each message's raw_ts for citation.
+slack_user_cli read <channel_id> --since <start_date> --limit 200 --json --expand-thread
 ```
 
-- Filter the output to messages on or after the start date.
-- Identify every top-level message that has `[N replies]` — these are threads.
-- Also note standalone messages (no replies) that contain decisions or actions.
+- Each message carries `raw_ts`; keep it for permalinks and for filtering on the
+  exact cutoff.
+- Threads arrive inline under `replies` (with `--expand-thread`) — no need to
+  re-fetch each one. To catch threads whose parent predates the window but got
+  fresh replies inside it, set `--since` a day or two earlier and filter replies
+  on `raw_ts >= cutoff`.
 
-### 3. Read each thread
+### 3. Cite each message with a real permalink
 
-For each threaded message, use the `url` command with a constructed permalink.
-The permalink format is:
-
-```
-https://<workspace>.slack.com/archives/<channel_id>/p<ts_without_dot>
-```
-
-To convert a displayed timestamp like `1772191041.209019` to a permalink `p`
-value, remove the dot: `p1772191041209019`.
-
-**However**, the `read` command output doesn't show raw timestamps. Instead, use
-`search` to find the thread starter message and get its context, then use the
-`url` command:
+Use the `permalink` command with the message's `raw_ts` — **do not hand-build
+`/p<ts>` URLs**. Hand-built URLs only resolve for root messages; threaded
+replies need the `thread_ts`/`cid` query params that `chat.getPermalink`
+(behind `permalink`) returns:
 
 ```bash
-# Find thread by searching for unique keywords from the message
-slack_user_cli search "<unique phrase from message> in:<channel_name>" --count 3
+slack_user_cli permalink <channel_id> <raw_ts> [<raw_ts> ...] --json
+```
 
-# Read the full thread via permalink
+If you only have a permalink (not a raw_ts) and want the thread, the `url`
+command reads it directly:
+
+```bash
 slack_user_cli url "https://<workspace>.slack.com/archives/<channel_id>/p<ts>"
 ```
 
