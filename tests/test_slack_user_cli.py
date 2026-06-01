@@ -1894,6 +1894,9 @@ class TestExtractShared:
     def test_captures_author(self):
         assert _extract_shared(SHARED_MSG)[0]["author"] == "Genia Shipova"
 
+    def test_captures_full_text(self):
+        assert _extract_shared(SHARED_MSG)[0]["text"] == "here are the quotes"
+
     def test_ignores_plain_attachments(self):
         msg = {"attachments": [{"title": "a link preview", "text": "no share here"}]}
         assert _extract_shared(msg) == []

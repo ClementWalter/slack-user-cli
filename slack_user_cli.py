@@ -2618,6 +2618,16 @@ def _print_messages(
             if sh.get("url"):
                 sl.append(f" {sh['url']}", style="dim")
             console.print(sl)
+            # Render the full quoted message body, not just its attachments.
+            quoted_text = sh.get("text") or ""
+            if with_names:
+                quoted_text = _resolve_mentions(
+                    client, quoted_text, workspace=workspace
+                )
+            if quoted_text:
+                qt = Text(indent + "    ")
+                qt.append(quoted_text, style="dim")
+                console.print(qt)
             for f in sh.get("files", []) or []:
                 meta = f.get("filetype") or f.get("mimetype") or ""
                 if f.get("size"):
@@ -2913,6 +2923,13 @@ def _message_to_entry(
     # attachments are never missed.
     shared = _extract_shared(msg)
     if shared:
+        if with_names:
+            # Resolve <@U…> mentions inside the quoted body too, matching the
+            # parent message's text treatment.
+            for sh in shared:
+                sh["text"] = _resolve_mentions(
+                    client, sh.get("text", ""), workspace=workspace
+                )
         entry["shared"] = shared
     # Plain pasted Slack permalinks referencing other messages.
     links = _extract_links(msg)
