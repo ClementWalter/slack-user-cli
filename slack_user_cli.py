@@ -1032,6 +1032,14 @@ def _channel_type_label(ch: dict) -> str:
     "--json. Decisions often live in replies rather than the parent post; "
     "without this flag consumers only see parent messages.",
 )
+@click.option(
+    "--since",
+    default=None,
+    help="Only fetch messages at/after this time, as an ISO date "
+    "(2026-05-29) or datetime (2026-05-29T10:07:00); naive values are "
+    "treated as UTC. Sets the history `oldest` bound. Pair with a larger "
+    "--limit to pull a whole window rather than the default 20.",
+)
 @click.pass_context
 def read(
     ctx: click.Context,
@@ -1040,11 +1048,14 @@ def read(
     as_json: bool,
     with_names: bool,
     expand_thread: bool,
+    since: str | None,
 ) -> None:
     """Read recent messages from a channel."""
     client = get_client(workspace=ctx.obj["workspace"])
     ws = ctx.obj["workspace_name"]
     channel_id = resolve_channel(client, channel, workspace=ws)
+
+    oldest = _parse_since(since) if since else None
 
     messages: list[dict] = []
     cursor = None
@@ -1053,6 +1064,8 @@ def read(
             "channel": channel_id,
             "limit": min(limit - len(messages), 200),
         }
+        if oldest:
+            kwargs["oldest"] = oldest
         if cursor:
             kwargs["cursor"] = cursor
         try:
@@ -1263,6 +1276,59 @@ def url_command(
         )
     else:
         _print_messages(client, replies, workspace=ws, with_names=with_names)
+
+
+# -- permalink ----------------------------------------------------------------
+
+
+@cli.command()
+@click.argument("channel")
+@click.argument("ts", nargs=-1, required=True)
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    default=False,
+    help="Emit structured JSON ({channel, permalinks: {ts: url}}).",
+)
+@click.pass_context
+def permalink(
+    ctx: click.Context, channel: str, ts: tuple[str, ...], as_json: bool
+) -> None:
+    """Get canonical chat.getPermalink URL(s) for one or more message TS.
+
+    Pass a channel (name or ID) and one or more message timestamps (the
+    full-precision `raw_ts` from `read --json`). Unlike a hand-built
+    `/p<ts>` URL, the returned permalink is thread-aware — it carries the
+    `thread_ts`/`cid` query params a threaded reply needs to navigate, so
+    it resolves correctly for replies, not just root messages.
+    """
+    client = get_client(workspace=ctx.obj["workspace"])
+    ws = ctx.obj["workspace_name"]
+    channel_id = resolve_channel(client, channel, workspace=ws)
+
+    results: dict[str, str] = {}
+    for message_ts in ts:
+        try:
+            resp = client.chat_getPermalink(
+                channel=channel_id, message_ts=message_ts
+            )
+            results[message_ts] = resp.get("permalink", "")
+        except SlackApiError as exc:
+            # Record the error against this ts rather than aborting the batch
+            # so one bad ts doesn't lose the permalinks for the rest.
+            err = (exc.response.data or {}).get("error", str(exc))
+            results[message_ts] = f"ERROR: {err}"
+
+    if as_json:
+        click.echo(
+            json.dumps(
+                {"channel": channel_id, "permalinks": results}, ensure_ascii=False
+            )
+        )
+    else:
+        for message_ts, url in results.items():
+            console.print(f"{message_ts}\t{url}")
 
 
 # -- users --------------------------------------------------------------------
@@ -2346,6 +2412,26 @@ def _format_ts(ts: str) -> str:
         return ts
 
 
+def _parse_since(value: str) -> str:
+    """Convert an ISO date/datetime to a Slack `oldest` epoch string.
+
+    Accepts a date (``2026-05-29``) or datetime (``2026-05-29T10:07:00``).
+    A value without an explicit timezone is interpreted as UTC, matching how
+    Slack timestamps are rendered elsewhere in this CLI.
+    """
+    from datetime import datetime, timezone  # noqa: PLC0415
+
+    try:
+        dt = datetime.fromisoformat(value.strip())
+    except ValueError as exc:
+        raise click.ClickException(
+            f"--since: not an ISO date/datetime: {value!r}"
+        ) from exc
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return f"{dt.timestamp():.6f}"
+
+
 def _print_messages(
     client: WebClient,
     messages: list[dict],
@@ -2488,17 +2574,23 @@ def _message_to_entry(
 
     entry: dict = {
         "ts": _format_ts(msg.get("ts", "")),
+        # Full-precision Slack ts on every message. The `ts` field above is
+        # minute-precision for humans; callers need the microsecond ts to build
+        # real permalinks (via the `permalink` command) or to pass back to
+        # `click`. Emitted unconditionally so regular messages — not just
+        # block-kit ones — are addressable.
+        "raw_ts": msg.get("ts", ""),
         "user": username,
         "text": text,
     }
+    thread_ts = msg.get("thread_ts")
+    if thread_ts:
+        entry["thread_ts"] = thread_ts
     reply_count = msg.get("reply_count", 0)
-    if msg.get("thread_ts") and reply_count:
+    if thread_ts and reply_count:
         entry["threadCount"] = reply_count
     actions = _extract_actions(msg.get("blocks", []) or [])
     if actions:
-        # Expose the raw ts so callers can pass it back to `click` without
-        # losing precision to the human-readable formatter above.
-        entry["raw_ts"] = msg.get("ts", "")
         entry["actions"] = actions
         bot_id = msg.get("bot_id")
         app_id = msg.get("app_id")
