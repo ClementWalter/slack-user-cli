@@ -58,6 +58,12 @@ slack_user_cli login --manual
 - **`--names` is opt-in.** Only when the user specifically wants display names
   (e.g. "show me who said what", "summarize this thread"), pass `--names` to
   resolve user/channel IDs and rewrite `<@UXXX>` mentions.
+- **CRITICAL — never guess a name.** A name attributed to a message must come
+  from `--names` resolution (or an explicit `users`/`search` lookup), **never**
+  from inference. Do not guess an author from the message content, from a
+  username stem, from a DM/MPIM conversation title, or from surrounding context —
+  that is silent misattribution and a correctness failure. If a name will not
+  resolve, keep the raw `U…` ID and say so; do not approximate or invent one.
 - **`--json` everywhere.** Every command supports `--json` for structured
   output. Use it whenever a programmatic consumer would otherwise parse rendered
   text. `--json` and `--names` are independent.
