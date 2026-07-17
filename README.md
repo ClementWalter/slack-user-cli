@@ -109,3 +109,14 @@ the channel-summary workflow.
 Channel and user data is cached at `~/.config/slack-user-cli/cache/<workspace>/`
 with a 1-hour TTL. Run `slack_user_cli refresh` to force-rebuild after joining
 new channels or when lookups return IDs instead of names.
+
+## Running tests
+
+The test suite is a self-contained `uv` script, same as the CLI itself:
+
+```bash
+uv run tests/test_slack_user_cli.py
+```
+
+WebClient and `slacktokens` are mocked throughout, so this never touches a
+real Slack workspace or the local Slack desktop app.

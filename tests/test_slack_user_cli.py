@@ -1,12 +1,13 @@
 #!/usr/bin/env -S uv run
 # /// script
-# requires-python = ">=3.11"
+# requires-python = ">=3.11,<3.12"  # leveldb 0.201 (via slacktokens) uses PyUnicode_AS_UNICODE, removed in 3.12
 # dependencies = [
 #     "pytest>=8.0",
 #     "slack-sdk>=3.33",
 #     "slacktokens>=0.2.6",
 #     "click>=8.0",
 #     "rich>=13.0",
+#     "requests>=2.31",
 # ]
 # ///
 """Unit tests for slack_user_cli.py.
@@ -16,12 +17,15 @@ to avoid real API calls.
 """
 
 import json
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 from click.testing import CliRunner
 from slack_sdk.errors import SlackApiError
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from slack_user_cli import (
     _channel_type_label,
@@ -721,6 +725,103 @@ class TestLoginBrowser:
             input="\n",
         )
         assert "New Team" in result.output
+
+
+class TestLoginAuto:
+    """slacktokens returns nested dicts, not plain strings:
+
+    tokens: {workspace_url: {'token': str, 'name': str}, ...}
+    cookie: {'name': 'd', 'value': str}
+
+    _login_auto must unwrap both before handing them to WebClient/config.
+    """
+
+    @patch("slacktokens.get_tokens_and_cookie")
+    @patch("slack_user_cli.WebClient")
+    def test_passes_plain_string_token_to_webclient(
+        self, mock_wc_cls, mock_get_tokens_and_cookie, runner, tmp_config
+    ):
+        mock_instance = MagicMock()
+        mock_instance.auth_test.return_value = {"user": "u", "team": "Team Alpha"}
+        mock_wc_cls.return_value = mock_instance
+        mock_get_tokens_and_cookie.return_value = {
+            "tokens": {"T001": {"token": "xoxc-alpha", "name": "Alpha"}},
+            "cookie": {"name": "d", "value": "xoxd-cookie"},
+        }
+
+        result = runner.invoke(cli, ["login", "--auto"])
+
+        assert result.exit_code == 0
+        _, kwargs = mock_wc_cls.call_args
+        assert kwargs["token"] == "xoxc-alpha"
+
+    @patch("slacktokens.get_tokens_and_cookie")
+    @patch("slack_user_cli.WebClient")
+    def test_saves_plain_string_cookie(
+        self, mock_wc_cls, mock_get_tokens_and_cookie, runner, tmp_config
+    ):
+        mock_instance = MagicMock()
+        mock_instance.auth_test.return_value = {"user": "u", "team": "Team Alpha"}
+        mock_wc_cls.return_value = mock_instance
+        mock_get_tokens_and_cookie.return_value = {
+            "tokens": {"T001": {"token": "xoxc-alpha", "name": "Alpha"}},
+            "cookie": {"name": "d", "value": "xoxd-cookie"},
+        }
+
+        runner.invoke(cli, ["login", "--auto"])
+
+        config = json.loads(tmp_config.read_text())
+        assert config["cookie"] == "xoxd-cookie"
+
+    @patch("slacktokens.get_tokens_and_cookie")
+    @patch("slack_user_cli.WebClient")
+    def test_saves_all_workspaces_by_name(
+        self, mock_wc_cls, mock_get_tokens_and_cookie, runner, tmp_config
+    ):
+        mock_instance = MagicMock()
+        mock_instance.auth_test.side_effect = [
+            {"user": "u1", "team": "Team Alpha"},
+            {"user": "u2", "team": "Team Beta"},
+        ]
+        mock_wc_cls.return_value = mock_instance
+        mock_get_tokens_and_cookie.return_value = {
+            "tokens": {
+                "T001": {"token": "xoxc-alpha", "name": "Alpha"},
+                "T002": {"token": "xoxc-beta", "name": "Beta"},
+            },
+            "cookie": {"name": "d", "value": "xoxd-cookie"},
+        }
+
+        runner.invoke(cli, ["login", "--auto"])
+
+        config = json.loads(tmp_config.read_text())
+        assert len(config["workspaces"]) == 2
+
+    @patch("slacktokens.get_tokens_and_cookie")
+    def test_raises_when_no_tokens_found(
+        self, mock_get_tokens_and_cookie, runner, tmp_config
+    ):
+        mock_get_tokens_and_cookie.return_value = {"tokens": {}, "cookie": {}}
+
+        result = runner.invoke(cli, ["login", "--auto"])
+
+        assert result.exit_code != 0
+
+    @patch("slacktokens.get_tokens_and_cookie")
+    def test_skips_malformed_token_entries(
+        self, mock_get_tokens_and_cookie, runner, tmp_config
+    ):
+        """A workspace entry missing its 'token' key must be filtered out,
+        not passed through to WebClient (which would blow up on empty auth)."""
+        mock_get_tokens_and_cookie.return_value = {
+            "tokens": {"T001": {"name": "Alpha"}},
+            "cookie": {"name": "d", "value": "xoxd-cookie"},
+        }
+
+        result = runner.invoke(cli, ["login", "--auto"])
+
+        assert result.exit_code != 0
+        assert "No tokens found" in result.output
 
 
 class TestChannelsCommand:
@@ -1954,3 +2055,7 @@ class TestDownloadQuotedMessage:
         out = tmp_path / "dl"
         runner.invoke(cli, ["download", "C123", "1700000000.000000", "-o", str(out)])
         assert (out / "quote.pdf").read_bytes() == b"PDF"
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))
