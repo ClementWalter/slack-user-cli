@@ -180,7 +180,7 @@ slack_user_cli user-channels <user_name_or_id> --type "public_channel,private_ch
 # of guessing it. Backed by the permanent id→name store: one API call per ID the
 # first time, none thereafter. Mixes users and channels freely.
 slack_user_cli resolve C01234ABCDE U05678FGHIJ
-slack_user_cli resolve C01234ABCDE U05678FGHIJ --json   # {"resolved": {"C01234ABCDE": "...", "U05678FGHIJ": "alex"}}
+slack_user_cli resolve C01234ABCDE U05678FGHIJ --json   # {"resolved": {"C01234ABCDE": "engineering", "U05678FGHIJ": "alex"}}
 ```
 
 ### Writing
