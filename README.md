@@ -37,6 +37,12 @@ npx skills add ClementWalter/slack-user-cli
 After install, Claude Code picks it up automatically — see
 [`SKILL.md`](SKILL.md) for what the skill exposes.
 
+To also use it directly from a terminal, alias the installed copy:
+
+```bash
+alias slack_user_cli='uv run ~/.claude/skills/slack-user-cli/slack_user_cli.py'
+```
+
 ## Install as a standalone CLI
 
 The CLI is a single-file Python script with
@@ -70,11 +76,22 @@ slack_user_cli login --manual
 
 ## Usage
 
+The workspace from your *first* successful `login` automatically becomes the
+default — every command uses it unless overridden. Logging in to more
+workspaces later doesn't change the default; switch it explicitly:
+
 ```bash
-# Workspaces
+# List saved workspaces (marks which one is default)
 slack_user_cli workspaces
+
+# Permanently change the default workspace
 slack_user_cli default "Workspace Name"
 
+# Override the default for a single command, without changing it
+slack_user_cli -w "Other Workspace" channels
+```
+
+```bash
 # Read
 slack_user_cli channels
 slack_user_cli read <channel> --limit 20
@@ -92,9 +109,6 @@ slack_user_cli send <channel> "message text"
 slack_user_cli send <channel> "reply" --thread <message_ts>
 slack_user_cli dm <user> "message text"
 slack_user_cli upload <channel> /path/to/file.png --message "caption"
-
-# Cross-workspace
-slack_user_cli -w "Other Workspace" channels
 ```
 
 Every read command emits raw Slack IDs by default (stable for scripting); pass

@@ -171,6 +171,14 @@ class TestGetWorkspaceConfig:
         with pytest.raises(Exception, match="not found"):
             get_workspace_config(config, "nonexistent")
 
+    def test_raises_distinct_error_when_no_default_set(self):
+        """Workspaces exist but 'default' is unset (e.g. a hand-edited
+        config.json) — the error should say so, not report a blank-named
+        workspace as 'not found'."""
+        config = {"workspaces": {"team1": {"token": "t"}}, "cookie": "c"}
+        with pytest.raises(Exception, match="No default workspace set"):
+            get_workspace_config(config, None)
+
     def test_returns_token_and_cookie(self):
         config = {
             "workspaces": {"myteam": {"token": "xoxc-t"}},
