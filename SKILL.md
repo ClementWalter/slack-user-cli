@@ -72,11 +72,20 @@ slack_user_cli login --manual
 
 ### Workspace Management
 
+The user's first successful `login` automatically becomes the default.
+If that login imports several workspaces at once (`--browser`/`--auto`) and
+it's running on a real terminal, the user is prompted to pick which one;
+non-interactively (e.g. invoked by an agent without a TTY), the first one
+wins silently. Logging in to additional workspaces later never changes an
+existing default. Every command uses the default unless `-w <name>` is
+passed (see [Cross-workspace Usage](#cross-workspace-usage)) or it's changed
+permanently with `default`.
+
 ```bash
-# List all saved workspaces
+# List all saved workspaces (marks which one is default)
 slack_user_cli workspaces
 
-# Set default workspace
+# Permanently change the default workspace
 slack_user_cli default "Workspace Name"
 
 # Force-refresh the channel and user cache

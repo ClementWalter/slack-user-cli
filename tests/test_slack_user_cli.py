@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from slack_user_cli import (
     _channel_type_label,
+    _choose_default,
     _collect_raw_files,
     _download_file,
     _extract_files,
@@ -175,6 +176,14 @@ class TestGetWorkspaceConfig:
         with pytest.raises(Exception, match="not found"):
             get_workspace_config(config, "nonexistent")
 
+    def test_raises_distinct_error_when_no_default_set(self):
+        """Workspaces exist but 'default' is unset (e.g. a hand-edited
+        config.json) — the error should say so, not report a blank-named
+        workspace as 'not found'."""
+        config = {"workspaces": {"team1": {"token": "t"}}, "cookie": "c"}
+        with pytest.raises(Exception, match="No default workspace set"):
+            get_workspace_config(config, None)
+
     def test_returns_token_and_cookie(self):
         config = {
             "workspaces": {"myteam": {"token": "xoxc-t"}},
@@ -201,6 +210,33 @@ class TestGetWorkspaceConfig:
         }
         ws = get_workspace_config(config, "b")
         assert ws["token"] == "tb"
+
+
+class TestChooseDefault:
+    def test_single_team_skips_prompt(self, monkeypatch):
+        # Even on a real terminal, one team needs no choice
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+        assert _choose_default(["Alpha"]) == "Alpha"
+
+    def test_non_interactive_picks_first_team(self, monkeypatch):
+        # Scripted/non-TTY invocations have no one to prompt
+        monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+        assert _choose_default(["Alpha", "Beta"]) == "Alpha"
+
+    def test_interactive_prompts_and_honors_choice(self, monkeypatch):
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+        with patch("click.prompt", return_value="2"):
+            assert _choose_default(["Alpha", "Beta"]) == "Beta"
+
+    def test_interactive_default_choice_is_first_team(self, monkeypatch):
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+        with patch("click.prompt", return_value="1"):
+            assert _choose_default(["Alpha", "Beta"]) == "Alpha"
+
+    def test_invalid_choice_falls_back_to_first_team(self, monkeypatch):
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+        with patch("click.prompt", return_value="not-a-number"):
+            assert _choose_default(["Alpha", "Beta"]) == "Alpha"
 
 
 # -- get_client tests ---------------------------------------------------------
@@ -671,6 +707,41 @@ class TestLoginBrowser:
         )
         config = json.loads(tmp_config.read_text())
         assert len(config["workspaces"]) == 2
+
+    @patch("slack_user_cli._choose_default", return_value="WS2")
+    @patch("slack_user_cli.subprocess")
+    @patch("slack_user_cli.WebClient")
+    def test_wires_chosen_default_into_config(
+        self, mock_wc_cls, mock_subprocess, mock_choose_default, runner, tmp_config
+    ):
+        """Whatever _choose_default() picks ends up as config['default'].
+        _choose_default's own interactive-vs-non-interactive logic is
+        covered directly in TestChooseDefault, without fighting CliRunner
+        over sys.stdin."""
+        mock_instance = MagicMock()
+        mock_instance.auth_test.side_effect = [
+            {"user": "u1", "team": "WS1"},
+            {"user": "u2", "team": "WS2"},
+        ]
+        mock_wc_cls.return_value = mock_instance
+
+        mock_subprocess.run.return_value = MagicMock(
+            stdout=json.dumps({
+                "teams": {
+                    "T1": {"name": "ws1", "token": "xoxc-1"},
+                    "T2": {"name": "ws2", "token": "xoxc-2"},
+                }
+            })
+        )
+
+        runner.invoke(
+            cli,
+            ["login", "--browser"],
+            input="\nxoxd-c\n",
+        )
+        config = json.loads(tmp_config.read_text())
+        assert config["default"] == "WS2"
+        mock_choose_default.assert_called_once_with(["WS1", "WS2"])
 
     @patch("slack_user_cli.subprocess")
     @patch("slack_user_cli.WebClient")
