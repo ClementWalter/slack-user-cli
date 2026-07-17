@@ -165,6 +165,53 @@ def _save_cache(workspace: str, kind: str, data: dict) -> None:
     path.write_text(json.dumps({"ts": time.time(), "data": data}))
 
 
+# -- Permanent ID→name store --------------------------------------------------
+#
+# Slack IDs are immutable and their names change rarely, so id→name resolutions
+# are cached forever with NO TTL. This avoids re-hitting the (rate-limited)
+# users_info / conversations_info / *_list endpoints for an ID already seen in
+# any prior invocation. `refresh` overwrites entries; individual resolutions and
+# full builds append to it. Kinds: "users" and "channels".
+
+
+def _permanent_path(workspace: str) -> Path:
+    """Return the never-expiring id→name store path for a workspace."""
+    return CONFIG_DIR / "cache" / workspace / "id_names.json"
+
+
+def _load_permanent(workspace: str) -> dict:
+    """Load the never-expiring id→name store (no TTL). Always has both kinds."""
+    store = {"users": {}, "channels": {}}
+    path = _permanent_path(workspace)
+    if not path.exists():
+        return store
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return store
+    store["users"].update(data.get("users", {}))
+    store["channels"].update(data.get("channels", {}))
+    return store
+
+
+def _permanent_get(workspace: str, kind: str, _id: str) -> str | None:
+    """Look up a single id→name mapping in the never-expiring store."""
+    if not workspace:
+        return None
+    return _load_permanent(workspace).get(kind, {}).get(_id)
+
+
+def _permanent_put(workspace: str, kind: str, mapping: dict[str, str]) -> None:
+    """Merge id→name entries into the never-expiring store (immutable IDs)."""
+    if not workspace or not mapping:
+        return
+    store = _load_permanent(workspace)
+    store.setdefault(kind, {}).update(mapping)
+    path = _permanent_path(workspace)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(store, ensure_ascii=False))
+
+
 def _get_active_workspace(config: dict | None = None, workspace: str | None = None) -> str:
     """Resolve the active workspace name for cache keying."""
     if config is None:
@@ -194,6 +241,8 @@ def build_channel_cache(client: WebClient, workspace: str) -> dict[str, str]:
         if not cursor:
             break
     _save_cache(workspace, "channels", name_to_id)
+    # Seed the never-expiring id→name store with the inverse mapping.
+    _permanent_put(workspace, "channels", {cid: name for name, cid in name_to_id.items()})
     logger.debug("Cached %d channels for %s", len(name_to_id), workspace)
     return name_to_id
 
@@ -234,6 +283,8 @@ def build_user_cache(client: WebClient, workspace: str) -> dict:
         "display_to_id": display_to_id,
     }
     _save_cache(workspace, "users", data)
+    # Seed the never-expiring id→name store (immutable IDs, one resolution forever).
+    _permanent_put(workspace, "users", id_to_display)
     logger.debug("Cached %d users for %s", len(id_to_display), workspace)
     return data
 
@@ -264,6 +315,13 @@ def resolve_user(client: WebClient, user_id: str, workspace: str = "") -> str:
     if user_id in _user_cache:
         return _user_cache[user_id]
 
+    # Never-expiring id→name store: IDs are immutable, so a prior resolution
+    # (from any earlier invocation) is reused forever with no API call.
+    name = _permanent_get(workspace, "users", user_id)
+    if name:
+        _user_cache[user_id] = name
+        return name
+
     # Passively check disk cache (no API call if missing)
     if workspace:
         cached = _load_cache(workspace, "users")
@@ -271,6 +329,7 @@ def resolve_user(client: WebClient, user_id: str, workspace: str = "") -> str:
             name = cached.get("id_to_display", {}).get(user_id)
             if name:
                 _user_cache[user_id] = name
+                _permanent_put(workspace, "users", {user_id: name})
                 return name
 
     # Fall back to single API call for unknown users
@@ -283,6 +342,9 @@ def resolve_user(client: WebClient, user_id: str, workspace: str = "") -> str:
             or user_id
         )
         _user_cache[user_id] = name
+        # Persist the resolution forever (skip the id→id non-resolution).
+        if name != user_id:
+            _permanent_put(workspace, "users", {user_id: name})
         return name
     except SlackApiError:
         logger.debug("Failed to resolve user %s", user_id)
@@ -326,6 +388,28 @@ def resolve_channel(client: WebClient, name_or_id: str, workspace: str = "") -> 
                 break
 
     raise click.ClickException(f"Channel '{name_or_id}' not found.")
+
+
+def resolve_channel_name(client: WebClient, channel_id: str, workspace: str = "") -> str:
+    """Resolve a channel ID (C…/G…) to its #name, cached forever.
+
+    Uses the never-expiring id→name store first, then a single
+    conversations_info call (cheap — avoids listing every channel), and
+    persists the result. Returns the raw ID if it cannot be resolved so callers
+    never silently invent a name.
+    """
+    name = _permanent_get(workspace, "channels", channel_id)
+    if name:
+        return name
+    try:
+        resp = client.conversations_info(channel=channel_id)
+        name = resp["channel"].get("name") or channel_id
+        if name != channel_id:
+            _permanent_put(workspace, "channels", {channel_id: name})
+        return name
+    except SlackApiError:
+        logger.debug("Failed to resolve channel %s", channel_id)
+        return channel_id
 
 
 # -- URL parsing --------------------------------------------------------------
@@ -925,6 +1009,37 @@ def refresh(ctx: click.Context, as_json: bool) -> None:
         console.print(f"  Cached [bold]{len(ch_map)}[/] channels")
         console.print(f"  Cached [bold]{user_count}[/] users")
         console.print("[green]Cache refreshed.[/]")
+
+
+@cli.command()
+@click.argument("ids", nargs=-1, required=True)
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit structured JSON.")
+@click.pass_context
+def resolve(ctx: click.Context, ids: tuple[str, ...], as_json: bool) -> None:
+    """Resolve user (U…) and channel (C…/G…) IDs to names.
+
+    Backed by the never-expiring id→name store, so each ID costs one API call
+    the first time and none thereafter. Use this to name an ID instead of
+    guessing it from context.
+    """
+    client = get_client(workspace=ctx.obj["workspace"])
+    ws = ctx.obj["workspace_name"]
+
+    out: dict[str, str] = {}
+    for _id in ids:
+        if _id[:1] == "U":
+            out[_id] = resolve_user(client, _id, ws)
+        elif _id[:1] in ("C", "G"):
+            out[_id] = resolve_channel_name(client, _id, ws)
+        else:
+            out[_id] = _id  # DMs (D…) and unknown prefixes have no channel name
+
+    if as_json:
+        click.echo(json.dumps({"resolved": out}, ensure_ascii=False))
+    else:
+        for _id, name in out.items():
+            mark = "" if name != _id else "  [dim](unresolved)[/]"
+            console.print(f"{_id} → [bold]{name}[/]{mark}")
 
 
 # -- channels -----------------------------------------------------------------

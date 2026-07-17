@@ -58,12 +58,26 @@ slack_user_cli login --manual
 - **`--names` is opt-in.** Only when the user specifically wants display names
   (e.g. "show me who said what", "summarize this thread"), pass `--names` to
   resolve user/channel IDs and rewrite `<@UXXX>` mentions.
-- **CRITICAL — never guess a name.** A name attributed to a message must come
-  from `--names` resolution (or an explicit `users`/`search` lookup), **never**
-  from inference. Do not guess an author from the message content, from a
-  username stem, from a DM/MPIM conversation title, or from surrounding context —
-  that is silent misattribution and a correctness failure. If a name will not
-  resolve, keep the raw `U…` ID and say so; do not approximate or invent one.
+- **CRITICAL — never guess a name; resolve it with a command.** This applies to
+  **both** user names and **channel** names. Every ID→name mapping must come from
+  an actual resolver command, **never** from inference (message content, username
+  stem, DM/MPIM/channel title, channel topic, or surrounding context) — that is
+  silent misattribution and a correctness failure. The proper commands:
+  - **Any ID (fastest):** `slack_user_cli resolve <id> [<id> …]` resolves both
+    user (`U…`) and channel (`C…`/`G…`) IDs in one call, backed by the permanent
+    id→name store (one API hit per new ID, none thereafter). This is the default
+    way to name an ID.
+  - **User ID → name:** also via `--names` on `read`/`thread`/`url`/`dm`
+    (resolves authors and rewrites `<@UXXX>` mentions), or `users --json`.
+  - **Channel ID → name:** `resolve` uses a single `conversations_info` call.
+    (`channels --all --json` also works but lists every channel and is
+    rate-limit-prone; `read <id> --json` does **not** return a name — it only
+    echoes the ID you passed.)
+  - If a name will not resolve (not in the workspace, rate-limited, etc.), keep
+    the raw `U…`/`C…` ID and **say so** — do not approximate or invent one, and do
+    not infer it from the topic or the conversation. `conversations.list` /
+    `users.list` are rate-limited; on `ratelimited`, wait and retry rather than
+    falling back to a guess.
 - **`--json` everywhere.** Every command supports `--json` for structured
   output. Use it whenever a programmatic consumer would otherwise parse rendered
   text. `--json` and `--names` are independent.
@@ -161,6 +175,12 @@ slack_user_cli users --json   # {users: [{id, name, display_name, real_name, sta
 slack_user_cli user-channels <user_name_or_id>
 slack_user_cli user-channels <user_name_or_id> --json
 slack_user_cli user-channels <user_name_or_id> --type "public_channel,private_channel,mpim"
+
+# Resolve one or more IDs to names — the RIGHT way to name a U…/C…/G… ID instead
+# of guessing it. Backed by the permanent id→name store: one API call per ID the
+# first time, none thereafter. Mixes users and channels freely.
+slack_user_cli resolve C01234ABCDE U05678FGHIJ
+slack_user_cli resolve C01234ABCDE U05678FGHIJ --json   # {"resolved": {"C01234ABCDE": "...", "U05678FGHIJ": "alex"}}
 ```
 
 ### Writing
@@ -319,6 +339,19 @@ slack_user_cli search "query" --count 20 --page 1
 slack_user_cli search "query" --json
 ```
 
+**Pull thread context via global search.** When asked to read or explain a
+specific thread, don't stop at that thread — a message is often a terse callback
+to a fuller discussion elsewhere. Pull 2–3 distinctive keywords/phrases from the
+thread and run a **global** (workspace-wide, not channel-scoped) `search` on
+them, then follow any Notion/GitHub/doc links found before answering. This
+routinely surfaces the prior design, decision, or doc that gives the current
+message its real meaning.
+
+```bash
+# After fetching the target thread, search the whole workspace for its key terms
+slack_user_cli search "<keyword from thread>" --count 15 --json
+```
+
 ### Canvases
 
 ```bash
@@ -360,17 +393,26 @@ slack_user_cli -w "Other Workspace" read general --limit 5
 Channel and user data is cached to disk for fast resolution:
 
 - **Location**: `~/.config/slack-user-cli/cache/<workspace>/`
-- **Files**: `channels.json` (name→id map), `users.json` (id→display, name→id,
-  display→id maps)
-- **TTL**: 1 hour — cache auto-expires and is rebuilt on next use
-- **Refresh**: run `slack_user_cli refresh` to force-rebuild both caches
-- **Behavior**: `resolve_user()` passively reads disk cache, falling back to a
-  single `users_info` API call — never triggers a full `users_list` build.
-  `resolve_channel()` and `_resolve_user_by_name()` will auto-build the cache on
-  first use if it doesn't exist.
+- **Files**:
+  - `channels.json` (name→id map) and `users.json` (id→display, name→id,
+    display→id maps) — the **name↔id lookup** caches, **TTL 1 hour**
+    (auto-expire and rebuild, since names/membership can change).
+  - `id_names.json` (`{users: {id: name}, channels: {id: name}}`) — the
+    **permanent id→name store**, **NO TTL**. Slack IDs are immutable, so once an
+    ID has been resolved to a name — by any prior invocation — it is reused
+    forever with no API call. Full builds (`refresh`) seed it; individual
+    `resolve`/`--names` lookups append to it.
+- **Refresh**: run `slack_user_cli refresh` to force-rebuild the TTL caches and
+  re-seed the permanent store (overwrites entries — the escape hatch if a
+  channel or display name actually changed).
+- **Behavior**: `resolve_user()` checks in-memory → permanent store → disk TTL
+  cache → a single `users_info` call, persisting anything it learns to
+  `id_names.json`. `resolve_channel_name()` (channel **id→name**) checks the
+  permanent store then a single `conversations_info` call — it never lists all
+  channels. `resolve_channel()` (name→id) auto-builds the TTL cache on first use.
 
-Run `refresh` after joining new channels or when user lookups return IDs instead
-of names.
+Run `refresh` after joining new channels or when a name lookup returns an ID and
+you suspect the underlying name changed.
 
 ## Key Details
 
