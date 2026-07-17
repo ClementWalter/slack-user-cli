@@ -76,9 +76,12 @@ slack_user_cli login --manual
 
 ## Usage
 
-The workspace from your *first* successful `login` automatically becomes the
-default — every command uses it unless overridden. Logging in to more
-workspaces later doesn't change the default; switch it explicitly:
+Your first successful `login` automatically becomes the default — every
+command uses it unless overridden. If that login imports several workspaces
+at once (`--browser`/`--auto`) and you're on a real terminal, you'll be
+asked which one should be default; non-interactively, the first one wins.
+Logging in to more workspaces later doesn't change the default; switch it
+explicitly:
 
 ```bash
 # List saved workspaces (marks which one is default)
