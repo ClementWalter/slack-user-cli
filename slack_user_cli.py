@@ -88,6 +88,12 @@ def get_workspace_config(config: dict, workspace: str | None) -> dict:
 
     if workspace is None:
         workspace = config.get("default", "")
+        if not workspace:
+            available = ", ".join(workspaces.keys())
+            raise click.ClickException(
+                "No default workspace set. Use -w <name> or run "
+                f"'default <name>' to set one. Available: {available}"
+            )
 
     if workspace not in workspaces:
         available = ", ".join(workspaces.keys())
