@@ -38,8 +38,11 @@ from slack_user_cli import (
     _format_ts,
     _link_parts,
     _load_cache,
+    _load_permanent,
     _message_to_entry,
     _parse_since,
+    _permanent_get,
+    _permanent_put,
     _save_cache,
     build_channel_cache,
     build_user_cache,
@@ -49,6 +52,7 @@ from slack_user_cli import (
     load_config,
     parse_slack_url,
     resolve_channel,
+    resolve_channel_name,
     resolve_user,
     save_config,
 )
@@ -322,6 +326,88 @@ class TestResolveChannel:
         }
         with pytest.raises(Exception, match="not found"):
             resolve_channel(mock_client, "nonexistent")
+
+
+# -- permanent id→name store tests --------------------------------------------
+
+
+class TestPermanentStore:
+    def test_get_returns_none_without_workspace(self, tmp_config):
+        assert _permanent_get("", "users", "U1") is None
+
+    def test_get_returns_none_when_absent(self, tmp_config):
+        assert _permanent_get("testteam", "users", "U1") is None
+
+    def test_put_then_get_roundtrips(self, tmp_config):
+        _permanent_put("testteam", "users", {"U1": "alice"})
+        assert _permanent_get("testteam", "users", "U1") == "alice"
+
+    def test_put_is_noop_without_workspace(self, tmp_config):
+        _permanent_put("", "users", {"U1": "alice"})
+        assert not _permanent_path_exists()
+
+    def test_put_merges_without_dropping_prior(self, tmp_config):
+        _permanent_put("testteam", "channels", {"C1": "general"})
+        _permanent_put("testteam", "channels", {"C2": "random"})
+        assert _permanent_get("testteam", "channels", "C1") == "general"
+
+    def test_kinds_are_isolated(self, tmp_config):
+        _permanent_put("testteam", "users", {"X1": "a-user"})
+        assert _permanent_get("testteam", "channels", "X1") is None
+
+    def test_load_always_has_both_kinds(self, tmp_config):
+        assert _load_permanent("testteam") == {"users": {}, "channels": {}}
+
+
+def _permanent_path_exists() -> bool:
+    """Helper: does the permanent store file exist for the test workspace?"""
+    from slack_user_cli import _permanent_path
+
+    return _permanent_path("").exists()
+
+
+class TestResolveUserPermanentCache:
+    def test_uses_permanent_store_without_api(self, mock_client, tmp_config):
+        _permanent_put("testteam", "users", {"UPERM": "stored"})
+        assert resolve_user(mock_client, "UPERM", "testteam") == "stored"
+
+    def test_permanent_hit_makes_no_api_call(self, mock_client, tmp_config):
+        _permanent_put("testteam", "users", {"UPERM": "stored"})
+        resolve_user(mock_client, "UPERM", "testteam")
+        assert mock_client.users_info.call_count == 0
+
+    def test_api_resolution_is_persisted(self, mock_client, tmp_config):
+        mock_client.users_info.return_value = {"user": {"profile": {"display_name": "fromapi"}}}
+        resolve_user(mock_client, "UNEW", "testteam")
+        assert _permanent_get("testteam", "users", "UNEW") == "fromapi"
+
+    def test_unresolved_id_is_not_persisted(self, mock_client, tmp_config):
+        mock_client.users_info.return_value = {"user": {"profile": {"display_name": ""}, "real_name": ""}}
+        resolve_user(mock_client, "UBAD", "testteam")
+        assert _permanent_get("testteam", "users", "UBAD") is None
+
+
+class TestResolveChannelName:
+    def test_uses_permanent_store_without_api(self, mock_client, tmp_config):
+        _permanent_put("testteam", "channels", {"CPERM": "research"})
+        assert resolve_channel_name(mock_client, "CPERM", "testteam") == "research"
+
+    def test_permanent_hit_makes_no_api_call(self, mock_client, tmp_config):
+        _permanent_put("testteam", "channels", {"CPERM": "research"})
+        resolve_channel_name(mock_client, "CPERM", "testteam")
+        assert mock_client.conversations_info.call_count == 0
+
+    def test_api_resolution_is_persisted(self, mock_client, tmp_config):
+        mock_client.conversations_info.return_value = {"channel": {"name": "general"}}
+        resolve_channel_name(mock_client, "CNEW", "testteam")
+        assert _permanent_get("testteam", "channels", "CNEW") == "general"
+
+    def test_returns_id_on_api_error(self, mock_client, tmp_config):
+        mock_client.conversations_info.side_effect = SlackApiError(
+            message="error",
+            response=MagicMock(status_code=200, data={"ok": False, "error": "channel_not_found"}),
+        )
+        assert resolve_channel_name(mock_client, "CFAIL", "testteam") == "CFAIL"
 
 
 # -- _channel_type_label tests -----------------------------------------------
