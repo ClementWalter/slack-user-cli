@@ -554,11 +554,24 @@ def _login_auto(config: dict) -> None:
         "and allow Keychain access when prompted.[/]"
     )
     result = get_tokens_and_cookie()
-    cookie = result.get("cookie", "")
+
+    # slacktokens returns cookie as {'name': 'd', 'value': str}
+    raw_cookie = result.get("cookie") or {}
+    cookie = (
+        raw_cookie.get("value", "")
+        if isinstance(raw_cookie, dict)
+        else str(raw_cookie)
+    )
     config["cookie"] = cookie
 
-    # slacktokens returns {cookie: str, tokens: {workspace: token, ...}}
-    tokens = result.get("tokens", {})
+    # slacktokens returns tokens as
+    # {workspace_url: {'token': str, 'name': str}, ...}
+    raw_tokens = result.get("tokens") or {}
+    tokens = {
+        v.get("name", k): v.get("token", "")
+        for k, v in raw_tokens.items()
+        if isinstance(v, dict) and v.get("token")
+    }
     if not tokens:
         raise click.ClickException(
             "No tokens found. Is Slack desktop installed and logged in?"
