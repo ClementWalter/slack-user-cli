@@ -20,6 +20,7 @@ import json
 import logging
 import re
 import subprocess
+import sys
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -748,7 +749,7 @@ def _try_validate_tokens(
 
     Returns (any_succeeded, cookie) so the caller can retry if needed.
     """
-    first_team = None
+    validated_teams: list[str] = []
     for ws_name, token in tokens.items():
         client = WebClient(
             token=token, headers={"cookie": f"d={cookie}"}
@@ -769,18 +770,36 @@ def _try_validate_tokens(
             "team": team,
             "user": user,
         }
-        if first_team is None:
-            first_team = team
+        validated_teams.append(team)
         console.print(
             f"[green]Logged in as [bold]{user}[/bold] "
             f"in [bold]{team}[/bold][/]"
         )
 
-    # Set default to first workspace if not already set
-    if first_team and "default" not in config:
-        config["default"] = first_team
+    if validated_teams and "default" not in config:
+        config["default"] = _choose_default(validated_teams)
 
-    return (first_team is not None, cookie)
+    return (bool(validated_teams), cookie)
+
+
+def _choose_default(teams: list[str]) -> str:
+    """Pick the default workspace out of teams just logged in.
+
+    With one workspace there's nothing to choose. With several, ask —
+    but only when attached to a real terminal; a non-interactive/scripted
+    invocation has no one to ask, so it keeps the old first-wins behavior.
+    """
+    if len(teams) == 1 or not sys.stdin.isatty():
+        return teams[0]
+
+    console.print("\n[bold]Which workspace should be the default?[/]")
+    for i, team in enumerate(teams, 1):
+        console.print(f"  {i}. {team}")
+    choice = click.prompt("Enter a number", default="1", show_default=True)
+    try:
+        return teams[int(choice) - 1]
+    except (ValueError, IndexError):
+        return teams[0]
 
 
 # -- workspaces ---------------------------------------------------------------
