@@ -700,12 +700,15 @@ class TestLoginBrowser:
         )
         assert result.exit_code != 0
 
+    @patch("slacktokens.get_cookie")
     @patch("slack_user_cli.subprocess")
     @patch("slack_user_cli.WebClient")
     def test_skips_cookie_prompt_when_already_stored(
-        self, mock_wc_cls, mock_subprocess, runner, saved_config
+        self, mock_wc_cls, mock_subprocess, mock_get_cookie, runner, saved_config
     ):
-        """When a cookie is already in config, don't prompt for it again."""
+        """When desktop-app cookie extraction fails but a cookie is already
+        in config, reuse it (accepting the default) instead of demanding a
+        fresh paste."""
         mock_instance = MagicMock()
         mock_instance.auth_test.return_value = {
             "user": "u", "team": "New Team"
@@ -718,13 +721,19 @@ class TestLoginBrowser:
             })
         )
 
-        # Only press Enter, no cookie prompt expected
+        # No desktop app / browser to extract a fresh cookie from
+        mock_get_cookie.side_effect = Exception("no browser found")
+
+        # Enter to confirm copy, then Enter again to accept the stored
+        # cookie as the prompt's default
         result = runner.invoke(
             cli,
             ["login", "--browser"],
-            input="\n",
+            input="\n\n",
         )
         assert "New Team" in result.output
+        config = json.loads(saved_config.read_text())
+        assert config["cookie"] == "xoxd-test"
 
 
 class TestLoginAuto:
