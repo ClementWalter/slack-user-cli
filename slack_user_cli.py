@@ -628,6 +628,56 @@ def login(mode: str | None, workspace_name: str | None) -> None:
         )
 
 
+def _patch_pycookiecheat_macos_slack_bugs() -> None:
+    """Work around two macOS bugs in pycookiecheat (<=0.8.0) when reading Slack's
+    cookie store, both upstream in pycookiecheat rather than in slacktokens.
+
+    1. It always looks up the Keychain entry under the account name
+       "Slack App Store Key", but direct-download installs of Slack (not from
+       the Mac App Store) use the account name "Slack Key" instead.
+    2. Its App-Store-vs-direct-download cookie file detection never expands
+       "~" before calling `.exists()`, so the check is always False and it
+       always falls back to the App Store container path — even when the
+       default-location Cookies file is right there.
+
+    Only engages if the unpatched lookup actually fails, so this is a no-op
+    once/if pycookiecheat fixes it upstream.
+    """
+    try:
+        import keyring
+        from pycookiecheat import chrome as _chrome
+        from pycookiecheat.common import BrowserType
+    except ImportError:
+        return
+
+    original_get_macos_config = _chrome.get_macos_config
+
+    def patched_get_macos_config(browser):
+        if browser is not BrowserType.SLACK:
+            return original_get_macos_config(browser)
+        try:
+            return original_get_macos_config(browser)
+        except ValueError:
+            key_material = keyring.get_password("Slack Safe Storage", "Slack Key")
+            if key_material is None:
+                raise
+            app_support = Path("Library/Application Support")
+            cookie_file = Path("~") / app_support / "Slack/Cookies"
+            if not cookie_file.expanduser().exists():
+                cookie_file = (
+                    Path("~/Library/Containers/com.tinyspeck.slackmacgap/Data")
+                    / app_support
+                    / "Slack/Cookies"
+                )
+            return {
+                "key_material": key_material,
+                "iterations": 1003,
+                "cookie_file": cookie_file,
+            }
+
+    _chrome.get_macos_config = patched_get_macos_config
+
+
 def _login_auto(config: dict) -> None:
     """Extract credentials from Slack desktop app via slacktokens."""
     try:
@@ -636,6 +686,8 @@ def _login_auto(config: dict) -> None:
         raise click.ClickException(
             "slacktokens not available. Use --manual or --browser instead."
         ) from exc
+
+    _patch_pycookiecheat_macos_slack_bugs()
 
     console.print(
         "[yellow]Extracting credentials from Slack desktop app…[/]"
@@ -679,6 +731,8 @@ def _get_cookie_auto_or_prompt(config: dict) -> str:
     """
     try:
         from slacktokens import get_cookie  # noqa: PLC0415
+
+        _patch_pycookiecheat_macos_slack_bugs()
 
         console.print(
             "[yellow]Extracting d cookie from Slack desktop app…[/]"
