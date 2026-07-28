@@ -96,6 +96,10 @@ passed (see [Cross-workspace Usage](#cross-workspace-usage)) or it's changed
 permanently with `default`.
 
 ```bash
+# Show who the active workspace's credentials belong to (own user ID, team ID)
+slack_user_cli whoami
+slack_user_cli whoami --json   # {"workspace": "…", "user": "…", "user_id": "U…", "team": "…", "team_id": "T…", "url": "https://….slack.com/"}
+
 # List all saved workspaces (marks which one is default)
 slack_user_cli workspaces
 
@@ -520,7 +524,9 @@ multiple threads, with columns: Issue | Impact | Status.
 - **"Not logged in"**: run `slack_user_cli login --browser` or `--manual`
 - **"Workspace not found"**: check available names with
   `slack_user_cli workspaces`
-- **Token expired**: tokens expire on Slack logout; re-run `login`
+- **Token expired**: tokens expire on Slack logout; re-run `login`.
+  `slack_user_cli whoami` tells you whether the stored credentials still work —
+  it hits the API, so it fails exactly when they've expired
 - **Too many channels**: `channels` shows only joined by default; this is
   correct
 - **macOS Keychain prompt**: expected when using `--auto` (cookie decryption)
