@@ -84,6 +84,9 @@ Logging in to more workspaces later doesn't change the default; switch it
 explicitly:
 
 ```bash
+# Show whose credentials the active workspace uses (own user ID, team ID)
+slack_user_cli whoami
+
 # List saved workspaces (marks which one is default)
 slack_user_cli workspaces
 

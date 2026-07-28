@@ -953,6 +953,56 @@ def _choose_default(teams: list[str]) -> str:
         return teams[0]
 
 
+# -- whoami -------------------------------------------------------------------
+
+
+@cli.command()
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    default=False,
+    help="Emit structured JSON.",
+)
+@click.pass_context
+def whoami(ctx: click.Context, as_json: bool) -> None:
+    """Show the identity behind the active workspace's credentials.
+
+    Hits auth.test rather than reading the stored 'user' field, so the output
+    doubles as a liveness check: it fails exactly when the token or d cookie
+    has expired.
+    """
+    client = get_client(workspace=ctx.obj["workspace"])
+    try:
+        resp = client.auth_test()
+    except SlackApiError as exc:
+        error = exc.response.get("error", str(exc))
+        raise click.ClickException(
+            f"Credentials rejected ({error}). Run 'login' to refresh them."
+        ) from exc
+
+    info = {
+        "workspace": ctx.obj["workspace_name"],
+        "user": resp.get("user", ""),
+        "user_id": resp.get("user_id", ""),
+        "team": resp.get("team", ""),
+        "team_id": resp.get("team_id", ""),
+        "url": resp.get("url", ""),
+    }
+
+    if as_json:
+        click.echo(json.dumps(info, ensure_ascii=False))
+        return
+
+    table = Table(title="Identity")
+    table.add_column("Field", style="cyan")
+    table.add_column("Value")
+    for field, value in info.items():
+        table.add_row(field, value)
+
+    console.print(table)
+
+
 # -- workspaces ---------------------------------------------------------------
 
 

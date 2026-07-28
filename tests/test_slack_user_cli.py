@@ -990,6 +990,90 @@ class TestLoginAuto:
         assert "No tokens found" in result.output
 
 
+class TestWhoamiCommand:
+    @pytest.fixture()
+    def auth_client(self):
+        """A client whose auth.test succeeds with a full identity payload."""
+        client = MagicMock()
+        client.auth_test.return_value = {
+            "ok": True,
+            "user": "alice",
+            "user_id": "U123",
+            "team": "testteam",
+            "team_id": "T456",
+            "url": "https://testteam.slack.com/",
+        }
+        return client
+
+    @patch("slack_user_cli.get_client")
+    def test_shows_user_name(self, mock_get_client, auth_client, runner, saved_config):
+        mock_get_client.return_value = auth_client
+        result = runner.invoke(cli, ["whoami"])
+        assert "alice" in result.output
+
+    @patch("slack_user_cli.get_client")
+    def test_shows_user_id(self, mock_get_client, auth_client, runner, saved_config):
+        mock_get_client.return_value = auth_client
+        result = runner.invoke(cli, ["whoami"])
+        assert "U123" in result.output
+
+    @patch("slack_user_cli.get_client")
+    def test_json_reports_user_id(self, mock_get_client, auth_client, runner, saved_config):
+        mock_get_client.return_value = auth_client
+        result = runner.invoke(cli, ["whoami", "--json"])
+        assert json.loads(result.output)["user_id"] == "U123"
+
+    @patch("slack_user_cli.get_client")
+    def test_json_reports_team_id(self, mock_get_client, auth_client, runner, saved_config):
+        mock_get_client.return_value = auth_client
+        result = runner.invoke(cli, ["whoami", "--json"])
+        assert json.loads(result.output)["team_id"] == "T456"
+
+    @patch("slack_user_cli.get_client")
+    def test_json_reports_active_workspace(
+        self, mock_get_client, auth_client, runner, saved_config
+    ):
+        """The workspace name comes from local config, not the API response —
+        it is the key the caches and -w flag are addressed by."""
+        mock_get_client.return_value = auth_client
+        result = runner.invoke(cli, ["whoami", "--json"])
+        assert json.loads(result.output)["workspace"] == "testteam"
+
+    @patch("slack_user_cli.get_client")
+    def test_missing_fields_render_as_empty(self, mock_get_client, runner, saved_config):
+        mock_client = MagicMock()
+        mock_client.auth_test.return_value = {"ok": True, "user": "alice"}
+        mock_get_client.return_value = mock_client
+        result = runner.invoke(cli, ["whoami", "--json"])
+        assert json.loads(result.output)["team_id"] == ""
+
+    @patch("slack_user_cli.get_client")
+    def test_expired_credentials_exit_nonzero(self, mock_get_client, runner, saved_config):
+        mock_client = MagicMock()
+        mock_client.auth_test.side_effect = SlackApiError(
+            "invalid_auth", {"ok": False, "error": "invalid_auth"}
+        )
+        mock_get_client.return_value = mock_client
+        result = runner.invoke(cli, ["whoami"])
+        assert result.exit_code != 0
+
+    @patch("slack_user_cli.get_client")
+    def test_expired_credentials_suggest_login(
+        self, mock_get_client, runner, saved_config
+    ):
+        mock_client = MagicMock()
+        mock_client.auth_test.side_effect = SlackApiError(
+            "invalid_auth", {"ok": False, "error": "invalid_auth"}
+        )
+        mock_get_client.return_value = mock_client
+        result = runner.invoke(cli, ["whoami"])
+        assert "invalid_auth" in result.output
+
+    def test_not_logged_in_exits_nonzero(self, runner, tmp_config):
+        result = runner.invoke(cli, ["whoami"])
+        assert result.exit_code != 0
+
+
 class TestChannelsCommand:
     @patch("slack_user_cli.get_client")
     def test_lists_joined_channels(self, mock_get_client, runner, saved_config):
