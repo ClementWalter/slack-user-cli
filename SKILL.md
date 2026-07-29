@@ -18,12 +18,22 @@ allowed-tools:
 Terminal access to Slack using browser session credentials (`xoxc-` token + `d`
 cookie). Located at `~/.claude/skills/slack-user-cli/slack_user_cli.py`.
 
-## Running
+## How to invoke
 
-All commands use `uv run`:
+Invoke it as **`slack-user`** — on `$PATH` via a symlink in `~/.local/bin` onto this
+repo's `bin/slack-user`, so it always runs the current checkout: a `git pull`, or even
+an uncommitted edit, takes effect immediately with nothing to reinstall.
 
 ```bash
-uv run ~/.claude/skills/slack-user-cli/slack_user_cli.py <command> [options]
+slack-user channels
+```
+
+Examples in this doc are written that way. If `slack-user` is not on `$PATH`, run the
+bundled launcher `bin/slack-user` resolved against this skill's own directory (PEP 723
+— `uv` resolves deps inline on first run), or link it once:
+
+```bash
+ln -sfn <skill-dir>/bin/slack-user ~/.local/bin/slack-user
 ```
 
 ## Authentication

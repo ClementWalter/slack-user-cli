@@ -37,10 +37,11 @@ npx skills add ClementWalter/slack-user-cli
 After install, Claude Code picks it up automatically — see
 [`SKILL.md`](SKILL.md) for what the skill exposes.
 
-To also use it directly from a terminal, alias the installed copy:
+To use it from any directory, put the launcher on `$PATH` — the symlink points at
+the checkout, so a `git pull` is all an upgrade takes:
 
 ```bash
-alias slack_user_cli='uv run ~/.claude/skills/slack-user-cli/slack_user_cli.py'
+ln -sfn ~/.claude/skills/slack-user-cli/bin/slack-user ~/.local/bin/slack-user
 ```
 
 ## Install as a standalone CLI
@@ -50,13 +51,14 @@ The CLI is a single-file Python script with
 [`uv`](https://docs.astral.sh/uv/) handles dependencies on the fly:
 
 ```bash
-uv run slack_user_cli.py --help
+slack-user --help
 ```
 
-For convenience, alias it:
+To use it from any directory, put the launcher on `$PATH` — the symlink points at
+the checkout, so a `git pull` is all an upgrade takes:
 
 ```bash
-alias slack_user_cli='uv run /path/to/slack-user-cli/slack_user_cli.py'
+ln -sfn /path/to/slack-user-cli/bin/slack-user ~/.local/bin/slack-user
 ```
 
 ## Authentication
