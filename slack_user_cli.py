@@ -696,16 +696,26 @@ def _patch_pycookiecheat_macos_slack_bugs() -> None:
 
 
 def _snapshot_leveldb(src: Path) -> Path:
-    """Copy a LevelDB dir without LOCK so it can be opened while Slack holds it."""
+    """Copy a LevelDB dir without LOCK so it can be opened while Slack holds it.
+
+    The caller owns the returned directory and must delete ``dest.parent``.
+    """
     parent = Path(tempfile.mkdtemp(prefix="slack-user-cli-leveldb-"))
     dest = parent / "leveldb"
-    shutil.copytree(src, dest, ignore=shutil.ignore_patterns("LOCK"))
+    try:
+        shutil.copytree(src, dest, ignore=shutil.ignore_patterns("LOCK"))
+    except Exception:
+        shutil.rmtree(parent, ignore_errors=True)
+        raise
     return dest
 
 
 @contextmanager
 def _unlocked_slack_leveldb():
-    """Open Slack Local Storage via a snapshot so a running desktop app does not block login."""
+    """Read Slack Local Storage from a temp copy so a running desktop app does not block login.
+
+    The copy is deleted when the context exits, on both success and failure.
+    """
     import leveldb  # noqa: PLC0415
 
     original = leveldb.LevelDB

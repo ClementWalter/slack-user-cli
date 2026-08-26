@@ -1078,6 +1078,32 @@ class TestSnapshotLeveldb:
             del holder
         assert value == b"v"
 
+    def test_unlocked_context_deletes_snapshot(self, tmp_path):
+        import leveldb
+        import tempfile
+
+        src = tmp_path / "src"
+        holder = self._seed_db(src)
+        before = set(Path(tempfile.gettempdir()).glob("slack-user-cli-leveldb-*"))
+        try:
+            with _unlocked_slack_leveldb():
+                db = leveldb.LevelDB(str(src))
+                db.Get(b"k")
+                del db
+            after = set(Path(tempfile.gettempdir()).glob("slack-user-cli-leveldb-*"))
+        finally:
+            del holder
+        assert after == before
+
+    def test_snapshot_cleans_up_on_copy_failure(self, tmp_path):
+        import tempfile
+
+        before = set(Path(tempfile.gettempdir()).glob("slack-user-cli-leveldb-*"))
+        with pytest.raises(Exception):
+            _snapshot_leveldb(tmp_path / "missing")
+        after = set(Path(tempfile.gettempdir()).glob("slack-user-cli-leveldb-*"))
+        assert after == before
+
 
 class TestWhoamiCommand:
     @pytest.fixture()
