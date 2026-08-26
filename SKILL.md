@@ -42,14 +42,14 @@ Must be logged in before using any command. Credentials are stored in
 `~/.config/slack-user-cli/config.json`.
 
 ```bash
-# Auto-extract from Slack desktop app (close Slack first)
-slack_user_cli login --auto
+# Auto-extract from Slack desktop app (Slack can stay open)
+slack-user login auto
 
 # Import all workspaces from browser — copies to clipboard, reads via pbpaste
-slack_user_cli login --browser
+slack-user login browser
 
 # Add a single workspace manually
-slack_user_cli login --manual
+slack-user login manual
 ```
 
 ## Global Options

@@ -19,9 +19,12 @@ or browser DevTools. No Slack app registration needed.
 import json
 import logging
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -569,21 +572,26 @@ def cli(ctx: click.Context, debug: bool, workspace: str | None) -> None:
 
 
 @cli.command()
+@click.argument(
+    "mode",
+    required=False,
+    type=click.Choice(["auto", "browser", "manual"], case_sensitive=False),
+)
 @click.option(
     "--auto",
-    "mode",
+    "mode_flag",
     flag_value="auto",
     help="Extract credentials from Slack desktop app.",
 )
 @click.option(
     "--manual",
-    "mode",
+    "mode_flag",
     flag_value="manual",
     help="Paste credentials from browser DevTools (one workspace).",
 )
 @click.option(
     "--browser",
-    "mode",
+    "mode_flag",
     flag_value="browser",
     help="Paste localStorage JSON from browser to import all workspaces.",
 )
@@ -592,16 +600,25 @@ def cli(ctx: click.Context, debug: bool, workspace: str | None) -> None:
     default=None,
     help="Name for this workspace (manual mode only).",
 )
-def login(mode: str | None, workspace_name: str | None) -> None:
+def login(
+    mode: str | None, mode_flag: str | None, workspace_name: str | None
+) -> None:
     """Authenticate with Slack using session credentials.
 
-    Three modes:
-      --auto     Extract from Slack desktop app (all workspaces).
-      --browser  Paste browser localStorage JSON (all workspaces).
-      --manual   Paste a single xoxc- token + d cookie.
+    MODE is auto (default), browser, or manual. Flags (--auto, --browser,
+    --manual) are aliases for the same modes.
+
+    \b
+    Examples:
+      slack-user login auto
+      slack-user login --auto
+      slack-user login browser
+      slack-user login manual
     """
-    if mode is None:
-        mode = "auto"
+    selected = {m.lower() for m in (mode, mode_flag) if m}
+    if len(selected) > 1:
+        raise click.UsageError("Pass only one login mode.")
+    mode = next(iter(selected), "auto")
 
     config = load_config()
     config.setdefault("workspaces", {})
@@ -678,6 +695,36 @@ def _patch_pycookiecheat_macos_slack_bugs() -> None:
     _chrome.get_macos_config = patched_get_macos_config
 
 
+def _snapshot_leveldb(src: Path) -> Path:
+    """Copy a LevelDB dir without LOCK so it can be opened while Slack holds it."""
+    parent = Path(tempfile.mkdtemp(prefix="slack-user-cli-leveldb-"))
+    dest = parent / "leveldb"
+    shutil.copytree(src, dest, ignore=shutil.ignore_patterns("LOCK"))
+    return dest
+
+
+@contextmanager
+def _unlocked_slack_leveldb():
+    """Open Slack Local Storage via a snapshot so a running desktop app does not block login."""
+    import leveldb  # noqa: PLC0415
+
+    original = leveldb.LevelDB
+    snapshots: list[Path] = []
+
+    def _LevelDB(path, *args, **kwargs):
+        snap = _snapshot_leveldb(Path(path))
+        snapshots.append(snap)
+        return original(str(snap), *args, **kwargs)
+
+    leveldb.LevelDB = _LevelDB
+    try:
+        yield
+    finally:
+        leveldb.LevelDB = original
+        for snap in snapshots:
+            shutil.rmtree(snap.parent, ignore_errors=True)
+
+
 def _login_auto(config: dict) -> None:
     """Extract credentials from Slack desktop app via slacktokens."""
     try:
@@ -692,11 +739,14 @@ def _login_auto(config: dict) -> None:
     console.print(
         "[yellow]Extracting credentials from Slack desktop app…[/]"
     )
-    console.print(
-        "[dim]Note: close Slack desktop first (LevelDB lock) "
-        "and allow Keychain access when prompted.[/]"
-    )
-    result = get_tokens_and_cookie()
+    console.print("[dim]Allow Keychain access if prompted.[/]")
+    try:
+        with _unlocked_slack_leveldb():
+            result = get_tokens_and_cookie()
+    except Exception as exc:
+        raise click.ClickException(
+            f"Failed to extract Slack desktop credentials: {exc}"
+        ) from exc
 
     # slacktokens returns cookie as {'name': 'd', 'value': str}
     raw_cookie = result.get("cookie") or {}
