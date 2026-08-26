@@ -66,14 +66,14 @@ ln -sfn /path/to/slack-user-cli/bin/slack-user ~/.local/bin/slack-user
 Credentials are stored in `~/.config/slack-user-cli/config.json`.
 
 ```bash
-# Auto-extract from the Slack desktop app (close Slack first; macOS Keychain prompt)
-slack_user_cli login --auto
+# Auto-extract from the Slack desktop app (Slack can stay open; macOS Keychain prompt)
+slack-user login auto
 
 # Import all workspaces from the browser via clipboard
-slack_user_cli login --browser
+slack-user login browser
 
 # Add a single workspace manually
-slack_user_cli login --manual
+slack-user login manual
 ```
 
 ## Usage

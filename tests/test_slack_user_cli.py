@@ -17,6 +17,7 @@ to avoid real API calls.
 """
 
 import json
+import shutil
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -44,6 +45,8 @@ from slack_user_cli import (
     _permanent_get,
     _permanent_put,
     _save_cache,
+    _snapshot_leveldb,
+    _unlocked_slack_leveldb,
     build_channel_cache,
     build_user_cache,
     cli,
@@ -988,6 +991,92 @@ class TestLoginAuto:
 
         assert result.exit_code != 0
         assert "No tokens found" in result.output
+
+    @patch("slacktokens.get_tokens_and_cookie")
+    @patch("slack_user_cli.WebClient")
+    def test_positional_auto_exits_zero(
+        self, mock_wc_cls, mock_get_tokens_and_cookie, runner, tmp_config
+    ):
+        mock_instance = MagicMock()
+        mock_instance.auth_test.return_value = {"user": "u", "team": "Team Alpha"}
+        mock_wc_cls.return_value = mock_instance
+        mock_get_tokens_and_cookie.return_value = {
+            "tokens": {"T001": {"token": "xoxc-alpha", "name": "Alpha"}},
+            "cookie": {"name": "d", "value": "xoxd-cookie"},
+        }
+
+        result = runner.invoke(cli, ["login", "auto"])
+
+        assert result.exit_code == 0
+
+    def test_rejects_conflicting_modes(self, runner, tmp_config):
+        result = runner.invoke(cli, ["login", "auto", "--manual"])
+
+        assert result.exit_code != 0
+
+    @patch("slacktokens.get_tokens_and_cookie")
+    def test_desktop_extraction_error_is_click_exception(
+        self, mock_get_tokens_and_cookie, runner, tmp_config
+    ):
+        mock_get_tokens_and_cookie.side_effect = RuntimeError(
+            "Slack's Local Storage database appears to be locked. Have you quit Slack?"
+        )
+
+        result = runner.invoke(cli, ["login", "auto"])
+
+        assert "Traceback" not in result.output
+
+
+class TestSnapshotLeveldb:
+    """Copy Slack's LevelDB without LOCK so login works while the app is running."""
+
+    def _seed_db(self, path: Path):
+        import leveldb
+
+        path.mkdir()
+        db = leveldb.LevelDB(str(path))
+        db.Put(b"k", b"v")
+        return db
+
+    def test_omits_lock_file(self, tmp_path):
+        src = tmp_path / "src"
+        db = self._seed_db(src)
+        del db
+        snap = _snapshot_leveldb(src)
+        try:
+            omitted = not (snap / "LOCK").exists()
+        finally:
+            shutil.rmtree(snap.parent, ignore_errors=True)
+        assert omitted
+
+    def test_copy_readable_while_source_locked(self, tmp_path):
+        import leveldb
+
+        src = tmp_path / "src"
+        holder = self._seed_db(src)
+        snap = _snapshot_leveldb(src)
+        try:
+            reader = leveldb.LevelDB(str(snap))
+            value = reader.Get(b"k")
+            del reader
+        finally:
+            del holder
+            shutil.rmtree(snap.parent, ignore_errors=True)
+        assert value == b"v"
+
+    def test_unlocked_context_reads_locked_source(self, tmp_path):
+        import leveldb
+
+        src = tmp_path / "src"
+        holder = self._seed_db(src)
+        try:
+            with _unlocked_slack_leveldb():
+                db = leveldb.LevelDB(str(src))
+                value = db.Get(b"k")
+                del db
+        finally:
+            del holder
+        assert value == b"v"
 
 
 class TestWhoamiCommand:
