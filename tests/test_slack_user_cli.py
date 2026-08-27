@@ -1797,6 +1797,55 @@ class TestDmCommand:
         result = runner.invoke(cli, ["dm", "U12345ABC"])
         assert "old msg" in result.output
 
+    @patch("slack_user_cli.get_client")
+    def test_dm_keep_since_drops_stale_history(
+        self, mock_get_client, runner, saved_config
+    ):
+        mock_client = MagicMock()
+        mock_client.conversations_open.return_value = {"channel": {"id": "D99"}}
+        mock_client.conversations_history.return_value = {
+            "messages": [{"user": "U1", "text": "old msg", "ts": "1700000000.000000"}]
+        }
+        mock_get_client.return_value = mock_client
+
+        result = runner.invoke(
+            cli, ["dm", "U12345ABC", "--keep-since", "2026-01-01", "--json"]
+        )
+        assert json.loads(result.output)["messages"] == []
+
+    @patch("slack_user_cli.get_client")
+    def test_dm_keep_since_implies_thread_expansion(
+        self, mock_get_client, runner, saved_config
+    ):
+        mock_client = MagicMock()
+        mock_client.conversations_open.return_value = {"channel": {"id": "D99"}}
+        mock_client.conversations_history.return_value = {
+            "messages": [
+                {
+                    "user": "U1",
+                    "text": "old parent",
+                    "ts": "1700000000.000000",
+                    "thread_ts": "1700000000.000000",
+                    "reply_count": 1,
+                }
+            ]
+        }
+        mock_client.conversations_replies.return_value = {
+            "messages": [
+                {"user": "U1", "text": "old parent", "ts": "1700000000.000000"},
+                {"user": "U2", "text": "new reply", "ts": "1790000000.000000"},
+            ],
+            "response_metadata": {"next_cursor": ""},
+        }
+        mock_get_client.return_value = mock_client
+
+        result = runner.invoke(
+            cli, ["dm", "U12345ABC", "--keep-since", "2026-01-01", "--json"]
+        )
+        payload = json.loads(result.output)
+        assert len(payload["messages"]) == 1
+        assert payload["messages"][0]["replies"][0]["after_cutoff"] is True
+
 
 class TestSearchCommand:
     @patch("slack_user_cli.get_client")

@@ -244,6 +244,11 @@ slack_user_cli dm <user_name_or_id> "message" --json
 # Read DM history (omit message; output: user IDs). Same --json shape as `read`.
 slack_user_cli dm <user_name_or_id>
 slack_user_cli dm <user_name_or_id> --json
+
+# dm has no --since to widen from first (raise --limit instead so old-enough
+# parents are actually fetched), but --keep-since still drops any thread with
+# nothing at/after it and tags after_cutoff, same as `read --keep-since`.
+slack_user_cli dm <user_name_or_id> --limit 40 --keep-since 2026-05-29 --json
 ```
 
 ### Clicking Block-Kit Buttons
