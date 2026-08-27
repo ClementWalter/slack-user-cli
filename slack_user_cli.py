@@ -1206,6 +1206,81 @@ def resolve(ctx: click.Context, ids: tuple[str, ...], as_json: bool) -> None:
             console.print(f"{_id} → [bold]{name}[/]{mark}")
 
 
+@cli.command(name="resolve-name")
+@click.argument("names", nargs=-1, required=True)
+@click.option(
+    "--type",
+    "kind",
+    type=click.Choice(["channel", "user"]),
+    default="channel",
+    help="Which namespace to resolve names in.",
+)
+@click.option(
+    "--cache-only",
+    is_flag=True,
+    default=False,
+    help=(
+        "Never fall back to the API on a cache miss — just report it "
+        "unresolved. Use this for a batch lookup where a rebuild "
+        "(conversations.list/users.list, both heavily rate-limited) would "
+        "be too slow; a real miss can still be resolved later with a plain "
+        "(non---cache-only) call."
+    ),
+)
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit structured JSON.")
+@click.pass_context
+def resolve_name(
+    ctx: click.Context, names: tuple[str, ...], kind: str, cache_only: bool, as_json: bool
+) -> None:
+    """Resolve channel or user names to IDs — the reverse of `resolve`.
+
+    Cache-first (the disk cache, then the never-expiring id→name store's
+    reverse). Without --cache-only, an unresolved name falls back to one API
+    call, which itself falls back to a full paginated rebuild
+    (conversations.list/users.list) if that single call also misses — slow
+    and rate-limit-prone, so pass --cache-only for a batch lookup that
+    should stay fast even when some names are misses. A name that still
+    doesn't resolve is reported as null (JSON) / "(not found)" (text)
+    rather than aborting the batch.
+    """
+    client = get_client(workspace=ctx.obj["workspace"])
+    ws = ctx.obj["workspace_name"]
+
+    out: dict[str, str | None] = {}
+    if cache_only:
+        # One cache load (builds it once if wholly missing/expired, otherwise
+        # a local disk read) — then every name is a plain dict lookup, no
+        # per-name API call regardless of how many names miss.
+        if kind == "channel":
+            channel_map = _get_channel_cache(client, ws)
+            out = {name: channel_map.get(name) for name in names}
+        else:
+            user_data = _get_user_cache(client, ws)
+            for name in names:
+                out[name] = user_data.get("name_to_id", {}).get(name) or user_data.get(
+                    "display_to_id", {}
+                ).get(name)
+    else:
+        for name in names:
+            try:
+                out[name] = (
+                    resolve_channel(client, name, ws)
+                    if kind == "channel"
+                    else _resolve_user_by_name(client, name, ws)
+                )
+            except click.ClickException:
+                out[name] = None
+
+    if as_json:
+        click.echo(json.dumps({"resolved": out}, ensure_ascii=False))
+    else:
+        for name, _id in out.items():
+            if _id is None:
+                console.print(f"{name} →  [dim](not found)[/]")
+            else:
+                console.print(f"{name} → [bold]{_id}[/]")
+
+
 # -- channels -----------------------------------------------------------------
 
 
@@ -1357,6 +1432,19 @@ def _channel_type_label(ch: dict) -> str:
     "treated as UTC. Sets the history `oldest` bound. Pair with a larger "
     "--limit to pull a whole window rather than the default 20.",
 )
+@click.option(
+    "--keep-since",
+    default=None,
+    help="Stricter than --since: drop any thread where neither the parent "
+    "nor any reply is at/after this time (same format as --since). Use a "
+    "--since a few days earlier than --keep-since so parents of hot threads "
+    "that predate --keep-since but got new replies after it aren't missed — "
+    "--since only bounds parents server-side, it can't see into replies. "
+    "Implies --expand-thread (threads must be expanded to check reply "
+    "times). Every kept message is tagged `after_cutoff: true/false` in "
+    "JSON output so a caller can tell what's actually new without "
+    "re-deriving it.",
+)
 @click.pass_context
 def read(
     ctx: click.Context,
@@ -1366,6 +1454,7 @@ def read(
     with_names: bool,
     expand_thread: bool,
     since: str | None,
+    keep_since: str | None,
 ) -> None:
     """Read recent messages from a channel."""
     client = get_client(workspace=ctx.obj["workspace"])
@@ -1373,6 +1462,9 @@ def read(
     channel_id = resolve_channel(client, channel, workspace=ws)
 
     oldest = _parse_since(since) if since else None
+    cutoff = _parse_since(keep_since) if keep_since else None
+    if cutoff:
+        expand_thread = True
 
     messages: list[dict] = []
     cursor = None
@@ -1408,12 +1500,37 @@ def read(
             if msg.get("thread_ts") and msg.get("reply_count", 0) and ts:
                 msg["_replies"] = _fetch_thread_replies(client, channel_id, ts)
 
+    if cutoff:
+        messages = _filter_keep_since(messages, cutoff)
+
     if as_json:
         _emit_messages_json(
             client, channel, messages, workspace=ws, with_names=with_names
         )
     else:
         _print_messages(client, messages, workspace=ws, with_names=with_names)
+
+
+def _filter_keep_since(messages: list[dict], cutoff: str) -> list[dict]:
+    """Drop threads with no activity at/after `cutoff`; tag the rest.
+
+    `cutoff` and message `ts` are both Slack-style `"<secs>.<micros>"`
+    strings, which sort correctly as plain strings — no float parsing
+    needed. Tags every kept parent/reply with `after_cutoff` so a caller
+    doesn't have to re-derive it.
+    """
+    kept: list[dict] = []
+    for msg in messages:
+        replies = msg.get("_replies") or []
+        parent_after = msg.get("ts", "") >= cutoff
+        reply_after = any(r.get("ts", "") >= cutoff for r in replies)
+        if not (parent_after or reply_after):
+            continue
+        msg["after_cutoff"] = parent_after
+        for r in replies:
+            r["after_cutoff"] = r.get("ts", "") >= cutoff
+        kept.append(msg)
+    return kept
 
 
 def _fetch_thread_replies(
@@ -3213,6 +3330,11 @@ def _message_to_entry(
         "user": username,
         "text": text,
     }
+    # Set only by `read --keep-since`; passes through the parent/reply split
+    # that filter already computed rather than making every caller re-derive
+    # "is this actually new" from raw_ts + a cutoff it has to know about too.
+    if "after_cutoff" in msg:
+        entry["after_cutoff"] = msg["after_cutoff"]
     thread_ts = msg.get("thread_ts")
     if thread_ts:
         entry["thread_ts"] = thread_ts

@@ -159,11 +159,18 @@ slack_user_cli read <channel_name_or_id> --limit 20 --json --expand-thread
 
 # Time-bounded fetch: only messages at/after an ISO date or datetime (UTC if
 # no tz). Sets the history `oldest` bound; pair with a larger --limit to pull a
-# whole window. To catch threads whose parent predates the window but that got
-# fresh replies inside it, set --since a couple of days earlier, --expand-thread,
-# and filter on each message's raw_ts >= your real cutoff.
+# whole window.
 slack_user_cli read <channel_name_or_id> --since 2026-05-29 --limit 200 --json --expand-thread
 slack_user_cli read <channel_name_or_id> --since 2026-05-29T10:07:00 --limit 200 --json
+
+# Widen-then-filter, for a periodic digest's de-dup boundary: --since only
+# bounds parents server-side, so it misses a thread whose parent predates the
+# window but got fresh replies inside it. --keep-since fetches from the wider
+# --since, expands every thread (implied — no need to also pass
+# --expand-thread), drops any thread with nothing at/after --keep-since, and
+# tags every kept parent/reply `after_cutoff: true/false` so you don't have to
+# re-derive "is this actually new" from raw_ts yourself.
+slack_user_cli read <channel_name_or_id> --since 2026-05-27 --keep-since 2026-05-29 --limit 800 --json
 
 # Read thread replies (use --dm when CHANNEL is a user name, not a channel)
 slack_user_cli thread <channel_name_or_id> <message_ts>
@@ -195,6 +202,16 @@ slack_user_cli user-channels <user_name_or_id> --type "public_channel,private_ch
 # first time, none thereafter. Mixes users and channels freely.
 slack_user_cli resolve C01234ABCDE U05678FGHIJ
 slack_user_cli resolve C01234ABCDE U05678FGHIJ --json   # {"resolved": {"C01234ABCDE": "engineering", "U05678FGHIJ": "alex"}}
+
+# Resolve one or more NAMES to IDs — the reverse. --type channel (default) or
+# user. Cache-first; without --cache-only, a miss falls back to one API call,
+# which itself falls back to a full paginated conversations.list/users.list
+# rebuild if that also misses — slow and rate-limit-prone. Pass --cache-only
+# for a batch lookup that must stay fast even when some names miss (a real
+# miss reports as null/"(not found)" instead of aborting the batch, and can
+# still be resolved later with a plain, non---cache-only call).
+slack_user_cli resolve-name engineering marketing --json
+slack_user_cli resolve-name alex --type user --cache-only --json
 ```
 
 ### Writing
