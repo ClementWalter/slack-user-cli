@@ -36,6 +36,7 @@ from slack_user_cli import (
     _extract_files,
     _extract_links,
     _extract_shared,
+    _filter_keep_since,
     _format_ts,
     _link_parts,
     _load_cache,
@@ -411,6 +412,77 @@ class TestResolveChannelName:
             response=MagicMock(status_code=200, data={"ok": False, "error": "channel_not_found"}),
         )
         assert resolve_channel_name(mock_client, "CFAIL", "testteam") == "CFAIL"
+
+
+# -- resolve-name command tests ------------------------------------------------
+
+
+class TestResolveNameCommand:
+    @patch("slack_user_cli.get_client")
+    def test_resolves_channel_name(self, mock_get_client, runner, saved_config):
+        mock_client = MagicMock()
+        mock_client.conversations_list.return_value = {
+            "channels": [{"id": "C1", "name": "general"}],
+            "response_metadata": {"next_cursor": ""},
+        }
+        mock_get_client.return_value = mock_client
+        result = runner.invoke(cli, ["resolve-name", "general", "--json"])
+        assert json.loads(result.output) == {"resolved": {"general": "C1"}}
+
+    @patch("slack_user_cli.get_client")
+    def test_resolves_user_name(self, mock_get_client, runner, saved_config):
+        mock_client = MagicMock()
+        mock_client.users_list.return_value = {
+            "members": [{"id": "U1", "name": "alice", "profile": {"display_name": "Alice"}}],
+            "response_metadata": {"next_cursor": ""},
+        }
+        mock_get_client.return_value = mock_client
+        result = runner.invoke(cli, ["resolve-name", "alice", "--type", "user", "--json"])
+        assert json.loads(result.output) == {"resolved": {"alice": "U1"}}
+
+    @patch("slack_user_cli.get_client")
+    def test_unresolved_name_is_null_not_a_batch_abort(self, mock_get_client, runner, saved_config):
+        mock_client = MagicMock()
+        mock_client.conversations_list.return_value = {
+            "channels": [{"id": "C1", "name": "general"}],
+            "response_metadata": {"next_cursor": ""},
+        }
+        mock_get_client.return_value = mock_client
+        result = runner.invoke(cli, ["resolve-name", "general", "nonexistent", "--json"])
+        assert json.loads(result.output) == {"resolved": {"general": "C1", "nonexistent": None}}
+
+    @patch("slack_user_cli.get_client")
+    def test_cache_only_skips_api_on_channel_miss(self, mock_get_client, runner, saved_config):
+        mock_client = MagicMock()
+        mock_client.conversations_list.return_value = {
+            "channels": [{"id": "C1", "name": "general"}],
+            "response_metadata": {"next_cursor": ""},
+        }
+        mock_get_client.return_value = mock_client
+        result = runner.invoke(cli, ["resolve-name", "nonexistent", "--cache-only", "--json"])
+        assert json.loads(result.output) == {"resolved": {"nonexistent": None}}
+        # One list call to build the cache the first time, never a per-name retry.
+        assert mock_client.conversations_list.call_count == 1
+
+    @patch("slack_user_cli.get_client")
+    def test_cache_only_skips_api_on_user_miss(self, mock_get_client, runner, saved_config):
+        mock_client = MagicMock()
+        mock_client.users_list.return_value = {"members": [], "response_metadata": {"next_cursor": ""}}
+        mock_get_client.return_value = mock_client
+        result = runner.invoke(cli, ["resolve-name", "nonexistent", "--type", "user", "--cache-only", "--json"])
+        assert json.loads(result.output) == {"resolved": {"nonexistent": None}}
+        assert mock_client.users_list.call_count == 1
+
+    @patch("slack_user_cli.get_client")
+    def test_text_output_marks_not_found(self, mock_get_client, runner, saved_config):
+        mock_client = MagicMock()
+        mock_client.conversations_list.return_value = {
+            "channels": [],
+            "response_metadata": {"next_cursor": ""},
+        }
+        mock_get_client.return_value = mock_client
+        result = runner.invoke(cli, ["resolve-name", "nonexistent"])
+        assert "(not found)" in result.output
 
 
 # -- _channel_type_label tests -----------------------------------------------
@@ -1411,6 +1483,136 @@ class TestReadCommand:
         result = runner.invoke(cli, ["read", "general", "--json"])
         payload = json.loads(result.output)
         assert payload["messages"][0]["user"] == "U99"
+
+    @patch("slack_user_cli.get_client")
+    def test_keep_since_drops_fully_stale_thread(
+        self, mock_get_client, runner, saved_config
+    ):
+        mock_client = MagicMock()
+        mock_client.conversations_list.return_value = {
+            "channels": [{"id": "C1", "name": "general"}],
+            "response_metadata": {"next_cursor": ""},
+        }
+        mock_client.conversations_history.return_value = {
+            "messages": [{"user": "U1", "text": "old", "ts": "1700000000.000000"}],
+            "response_metadata": {"next_cursor": ""},
+        }
+        mock_get_client.return_value = mock_client
+
+        result = runner.invoke(
+            cli, ["read", "general", "--keep-since", "2026-01-01", "--json"]
+        )
+        assert json.loads(result.output)["messages"] == []
+
+    @patch("slack_user_cli.get_client")
+    def test_keep_since_keeps_thread_with_post_cutoff_reply(
+        self, mock_get_client, runner, saved_config
+    ):
+        mock_client = MagicMock()
+        mock_client.conversations_list.return_value = {
+            "channels": [{"id": "C1", "name": "general"}],
+            "response_metadata": {"next_cursor": ""},
+        }
+        mock_client.conversations_history.return_value = {
+            "messages": [
+                {
+                    "user": "U1",
+                    "text": "old parent",
+                    "ts": "1700000000.000000",
+                    "thread_ts": "1700000000.000000",
+                    "reply_count": 1,
+                }
+            ],
+            "response_metadata": {"next_cursor": ""},
+        }
+        # cutoff = 2026-01-01T00:00:00Z; reply lands well after it.
+        mock_client.conversations_replies.return_value = {
+            "messages": [
+                {"user": "U1", "text": "old parent", "ts": "1700000000.000000"},
+                {"user": "U2", "text": "new reply", "ts": "1790000000.000000"},
+            ],
+            "response_metadata": {"next_cursor": ""},
+        }
+        mock_get_client.return_value = mock_client
+
+        result = runner.invoke(
+            cli, ["read", "general", "--keep-since", "2026-01-01", "--json"]
+        )
+        payload = json.loads(result.output)
+        assert len(payload["messages"]) == 1
+        parent = payload["messages"][0]
+        assert parent["after_cutoff"] is False
+        assert parent["replies"][0]["after_cutoff"] is True
+
+    @patch("slack_user_cli.get_client")
+    def test_keep_since_implies_thread_expansion(
+        self, mock_get_client, runner, saved_config
+    ):
+        """--keep-since must see reply timestamps even without --expand-thread."""
+        mock_client = MagicMock()
+        mock_client.conversations_list.return_value = {
+            "channels": [{"id": "C1", "name": "general"}],
+            "response_metadata": {"next_cursor": ""},
+        }
+        mock_client.conversations_history.return_value = {
+            "messages": [
+                {
+                    "user": "U1",
+                    "text": "old parent",
+                    "ts": "1700000000.000000",
+                    "thread_ts": "1700000000.000000",
+                    "reply_count": 1,
+                }
+            ],
+            "response_metadata": {"next_cursor": ""},
+        }
+        mock_client.conversations_replies.return_value = {
+            "messages": [
+                {"user": "U1", "text": "old parent", "ts": "1700000000.000000"},
+                {"user": "U2", "text": "new reply", "ts": "1790000000.000000"},
+            ],
+            "response_metadata": {"next_cursor": ""},
+        }
+        mock_get_client.return_value = mock_client
+
+        result = runner.invoke(
+            cli, ["read", "general", "--keep-since", "2026-01-01", "--json"]
+        )
+        assert mock_client.conversations_replies.called
+        assert len(json.loads(result.output)["messages"]) == 1
+
+
+class TestFilterKeepSince:
+    def test_drops_thread_with_nothing_after_cutoff(self):
+        messages = [{"ts": "100.0", "_replies": [{"ts": "150.0"}]}]
+        assert _filter_keep_since(messages, "200.0") == []
+
+    def test_keeps_thread_whose_parent_is_after_cutoff(self):
+        messages = [{"ts": "300.0"}]
+        kept = _filter_keep_since(messages, "200.0")
+        assert kept[0]["after_cutoff"] is True
+
+    def test_keeps_thread_whose_only_a_reply_is_after_cutoff(self):
+        messages = [{"ts": "100.0", "_replies": [{"ts": "300.0"}]}]
+        kept = _filter_keep_since(messages, "200.0")
+        assert len(kept) == 1
+        assert kept[0]["after_cutoff"] is False
+        assert kept[0]["_replies"][0]["after_cutoff"] is True
+
+    def test_tags_every_reply_independently(self):
+        messages = [
+            {"ts": "300.0", "_replies": [{"ts": "100.0"}, {"ts": "400.0"}]}
+        ]
+        kept = _filter_keep_since(messages, "200.0")
+        replies = kept[0]["_replies"]
+        assert replies[0]["after_cutoff"] is False
+        assert replies[1]["after_cutoff"] is True
+
+    def test_string_comparison_matches_numeric_at_equal_width(self):
+        # Guards the string-compare shortcut: only valid because both sides
+        # are fixed-width "<10 digits>.<6 digits>" — this pins that shape.
+        assert _filter_keep_since([{"ts": "1699999999.999999"}], "1700000000.000000") == []
+        assert _filter_keep_since([{"ts": "1700000000.000000"}], "1700000000.000000") != []
 
 
 class TestThreadCommand:
