@@ -33,6 +33,7 @@ from slack_user_cli import (
     _choose_default,
     _collect_raw_files,
     _download_file,
+    _extract_block_text,
     _extract_files,
     _extract_links,
     _extract_shared,
@@ -1580,6 +1581,90 @@ class TestReadCommand:
         )
         assert mock_client.conversations_replies.called
         assert len(json.loads(result.output)["messages"]) == 1
+
+
+# A real Grafana on-call handoff: `text` is a one-line summary and every useful
+# field lives in the section blocks.
+HANDOFF_BLOCKS = [
+    {
+        "type": "section",
+        "text": {"type": "mrkdwn", "text": "On-call shifts update for schedule *Product On-Call*"},
+    },
+    {
+        "type": "section",
+        "text": {"type": "mrkdwn", "text": "*New on-call shift*\nsethschmidt (<@U1>)"},
+    },
+    {"type": "actions", "elements": [{"type": "button"}]},
+]
+
+
+class TestExtractBlockText:
+    def test_returns_section_text(self):
+        assert "sethschmidt (<@U1>)" in _extract_block_text(HANDOFF_BLOCKS)
+
+    def test_joins_sections_in_order(self):
+        assert _extract_block_text(HANDOFF_BLOCKS).startswith("On-call shifts update")
+
+    def test_skips_non_text_blocks(self):
+        assert "button" not in _extract_block_text(HANDOFF_BLOCKS)
+
+    def test_reads_section_fields(self):
+        blocks = [{"type": "section", "fields": [{"text": "shift: 13:00"}]}]
+        assert _extract_block_text(blocks) == "shift: 13:00"
+
+    def test_reads_header_blocks(self):
+        blocks = [{"type": "header", "text": {"text": "Shift changed"}}]
+        assert _extract_block_text(blocks) == "Shift changed"
+
+    @pytest.mark.parametrize("blocks", [None, [], [{"type": "divider"}]])
+    def test_returns_empty_when_nothing_to_extract(self, blocks):
+        assert _extract_block_text(blocks) == ""
+
+
+class TestReadBlocksFlag:
+    @staticmethod
+    def _client(message):
+        client = MagicMock()
+        client.conversations_list.return_value = {
+            "channels": [{"id": "C1", "name": "general"}],
+            "response_metadata": {"next_cursor": ""},
+        }
+        client.conversations_history.return_value = {
+            "messages": [message],
+            "response_metadata": {"next_cursor": ""},
+        }
+        client.users_info.return_value = {"user": {"profile": {"display_name": "grafana"}}}
+        return client
+
+    @patch("slack_user_cli.get_client")
+    def test_blocks_flag_emits_block_text(self, mock_get_client, runner, saved_config):
+        mock_get_client.return_value = self._client(
+            {"user": "U1", "text": "shift changed", "ts": "1700000000.000",
+             "blocks": HANDOFF_BLOCKS}
+        )
+        result = runner.invoke(cli, ["read", "general", "--json", "--blocks"])
+        entry = json.loads(result.output)["messages"][0]
+        assert "sethschmidt" in entry["block_text"]
+
+    @patch("slack_user_cli.get_client")
+    def test_without_flag_block_text_is_absent(self, mock_get_client, runner, saved_config):
+        mock_get_client.return_value = self._client(
+            {"user": "U1", "text": "shift changed", "ts": "1700000000.000",
+             "blocks": HANDOFF_BLOCKS}
+        )
+        result = runner.invoke(cli, ["read", "general", "--json"])
+        assert "block_text" not in json.loads(result.output)["messages"][0]
+
+    @patch("slack_user_cli.get_client")
+    def test_omits_block_text_that_only_restates_text(
+        self, mock_get_client, runner, saved_config
+    ):
+        mock_get_client.return_value = self._client(
+            {"user": "U1", "text": "hello", "ts": "1700000000.000",
+             "blocks": [{"type": "section", "text": {"text": "hello"}}]}
+        )
+        result = runner.invoke(cli, ["read", "general", "--json", "--blocks"])
+        assert "block_text" not in json.loads(result.output)["messages"][0]
 
 
 class TestFilterKeepSince:
