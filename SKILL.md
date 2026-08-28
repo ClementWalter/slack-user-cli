@@ -91,6 +91,14 @@ slack-user login manual
 - **`--json` everywhere.** Every command supports `--json` for structured
   output. Use it whenever a programmatic consumer would otherwise parse rendered
   text. `--json` and `--names` are independent.
+- **`--blocks` when a bot message looks empty.** Apps that post rich messages
+  leave `text` as a one-line summary and put the content in block kit, which the
+  default output drops. If a bot message reads as a bare headline — "On-call
+  shift for schedule X has changed", "Deployment finished", a lone title with no
+  detail — the payload is in the blocks: re-read with `--json --blocks` and use
+  `block_text`. Grafana's on-call handoff is the standing example; its blocks
+  name who came on call and the exact window, none of which is in `text`.
+  Available on `read`, `thread`, `url` and `dm`.
 
 ## Commands Reference
 

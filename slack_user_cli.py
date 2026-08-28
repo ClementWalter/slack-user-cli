@@ -1445,6 +1445,17 @@ def _channel_type_label(ch: dict) -> str:
     "JSON output so a caller can tell what's actually new without "
     "re-deriving it.",
 )
+@click.option(
+    "--blocks",
+    "with_blocks",
+    is_flag=True,
+    default=False,
+    help="Attach each message's block-kit text as `block_text` (JSON only). "
+    "Apps that post rich messages leave `text` as a one-line summary and put "
+    "the content in blocks, so without this the payload is invisible: a "
+    "Grafana on-call handoff reads as \"the shift changed\" while the blocks "
+    "name the person and the window.",
+)
 @click.pass_context
 def read(
     ctx: click.Context,
@@ -1452,6 +1463,7 @@ def read(
     limit: int,
     as_json: bool,
     with_names: bool,
+    with_blocks: bool,
     expand_thread: bool,
     since: str | None,
     keep_since: str | None,
@@ -1505,7 +1517,8 @@ def read(
 
     if as_json:
         _emit_messages_json(
-            client, channel, messages, workspace=ws, with_names=with_names
+            client, channel, messages, workspace=ws, with_names=with_names,
+            with_blocks=with_blocks
         )
     else:
         _print_messages(client, messages, workspace=ws, with_names=with_names)
@@ -1588,6 +1601,17 @@ def _fetch_thread_replies(
     default=False,
     help="Resolve user IDs to display names. Default emits raw IDs.",
 )
+@click.option(
+    "--blocks",
+    "with_blocks",
+    is_flag=True,
+    default=False,
+    help="Attach each message's block-kit text as `block_text` (JSON only). "
+    "Apps that post rich messages leave `text` as a one-line summary and put "
+    "the content in blocks, so without this the payload is invisible: a "
+    "Grafana on-call handoff reads as \"the shift changed\" while the blocks "
+    "name the person and the window.",
+)
 @click.pass_context
 def thread(
     ctx: click.Context,
@@ -1597,6 +1621,7 @@ def thread(
     is_dm: bool,
     as_json: bool,
     with_names: bool,
+    with_blocks: bool,
 ) -> None:
     """Read thread replies for a given message timestamp."""
     client = get_client(workspace=ctx.obj["workspace"])
@@ -1638,7 +1663,8 @@ def thread(
     replies = replies[:limit]
     if as_json:
         _emit_messages_json(
-            client, channel, replies, workspace=ws, with_names=with_names
+            client, channel, replies, workspace=ws, with_names=with_names,
+            with_blocks=with_blocks
         )
     else:
         _print_messages(client, replies, workspace=ws, with_names=with_names)
@@ -1664,6 +1690,17 @@ def thread(
     default=False,
     help="Resolve user IDs to display names. Default emits raw IDs.",
 )
+@click.option(
+    "--blocks",
+    "with_blocks",
+    is_flag=True,
+    default=False,
+    help="Attach each message's block-kit text as `block_text` (JSON only). "
+    "Apps that post rich messages leave `text` as a one-line summary and put "
+    "the content in blocks, so without this the payload is invisible: a "
+    "Grafana on-call handoff reads as \"the shift changed\" while the blocks "
+    "name the person and the window.",
+)
 @click.pass_context
 def url_command(
     ctx: click.Context,
@@ -1671,6 +1708,7 @@ def url_command(
     limit: int,
     as_json: bool,
     with_names: bool,
+    with_blocks: bool,
 ) -> None:
     """Read a Slack thread from a permalink URL.
 
@@ -1706,7 +1744,8 @@ def url_command(
     replies = replies[:limit]
     if as_json:
         _emit_messages_json(
-            client, slack_url, replies, workspace=ws, with_names=with_names
+            client, slack_url, replies, workspace=ws, with_names=with_names,
+            with_blocks=with_blocks
         )
     else:
         _print_messages(client, replies, workspace=ws, with_names=with_names)
@@ -2541,6 +2580,17 @@ def upload(
     "--limit instead to make sure old-enough parents are even fetched. "
     "Implies --expand-thread; tags every kept message after_cutoff.",
 )
+@click.option(
+    "--blocks",
+    "with_blocks",
+    is_flag=True,
+    default=False,
+    help="Attach each message's block-kit text as `block_text` (JSON only). "
+    "Apps that post rich messages leave `text` as a one-line summary and put "
+    "the content in blocks, so without this the payload is invisible: a "
+    "Grafana on-call handoff reads as \"the shift changed\" while the blocks "
+    "name the person and the window.",
+)
 @click.pass_context
 def dm(
     ctx: click.Context,
@@ -2550,6 +2600,7 @@ def dm(
     thread_ts: str | None,
     as_json: bool,
     with_names: bool,
+    with_blocks: bool,
     expand_thread: bool,
     keep_since: str | None,
 ) -> None:
@@ -2610,7 +2661,12 @@ def dm(
             messages = _filter_keep_since(messages, cutoff)
         if as_json:
             _emit_messages_json(
-                client, dm_channel, messages, workspace=ws, with_names=with_names
+                client,
+                dm_channel,
+                messages,
+                workspace=ws,
+                with_names=with_names,
+                with_blocks=with_blocks,
             )
         else:
             _print_messages(client, messages, workspace=ws, with_names=with_names)
@@ -3312,11 +3368,35 @@ def _download_file(client: WebClient, file_info: dict, dest_dir: Path) -> Path:
     return path
 
 
+def _extract_block_text(blocks: list[dict]) -> str:
+    """Text carried by block kit but absent from a message's `text` field.
+
+    Apps that post rich messages put the payload in section/header blocks and
+    leave `text` as a one-line summary, so what a reader sees in Slack is
+    invisible to a `text`-only consumer. Grafana's on-call handoff notification
+    is the canonical case: `text` says only that the shift changed, while the
+    blocks name the person on call and the window they cover.
+    """
+    parts = []
+    for block in blocks or []:
+        if block.get("type") not in ("section", "header", "context"):
+            continue
+        body = block.get("text") or {}
+        if body.get("text"):
+            parts.append(body["text"])
+        # A section can carry its content in `fields` instead of `text`.
+        for field in block.get("fields") or []:
+            if field.get("text"):
+                parts.append(field["text"])
+    return "\n".join(parts)
+
+
 def _message_to_entry(
     client: WebClient,
     msg: dict,
     workspace: str,
     with_names: bool,
+    with_blocks: bool = False,
 ) -> dict:
     """Build the JSON entry for a single message.
 
@@ -3369,6 +3449,12 @@ def _message_to_entry(
     # consumer can't even tell a message carries files, let alone fetch them;
     # the entries here include the IDs and private URLs the `download` command
     # needs.
+    # Only when it adds something: a message whose blocks just restate `text`
+    # would otherwise double every entry's size for nothing.
+    if with_blocks:
+        block_text = _extract_block_text(msg.get("blocks", []) or [])
+        if block_text and block_text.strip() != (msg.get("text") or "").strip():
+            entry["block_text"] = block_text
     files = _extract_files(msg)
     if files:
         entry["files"] = files
@@ -3392,7 +3478,8 @@ def _message_to_entry(
     replies = msg.get("_replies") or []
     if replies:
         entry["replies"] = [
-            _message_to_entry(client, r, workspace, with_names) for r in replies
+            _message_to_entry(client, r, workspace, with_names, with_blocks)
+            for r in replies
         ]
     return entry
 
@@ -3403,9 +3490,13 @@ def _emit_messages_json(
     messages: list[dict],
     workspace: str = "",
     with_names: bool = False,
+    with_blocks: bool = False,
 ) -> None:
     """Emit messages as a single JSON object on stdout."""
-    parsed = [_message_to_entry(client, m, workspace, with_names) for m in messages]
+    parsed = [
+        _message_to_entry(client, m, workspace, with_names, with_blocks)
+        for m in messages
+    ]
     click.echo(
         json.dumps({"channel": channel, "messages": parsed}, ensure_ascii=False)
     )
