@@ -42,6 +42,8 @@ logger = logging.getLogger(__name__)
 CONFIG_DIR = Path.home() / ".config" / "slack-user-cli"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
+VAULT_DOCUMENT = "slack-user-cli config.json"
+
 console = Console()
 
 
@@ -51,7 +53,7 @@ def load_config() -> dict:
     Migrates legacy single-workspace format to multi-workspace on read.
     """
     if not CONFIG_FILE.exists():
-        return {}
+        return vault_config()
     config = json.loads(CONFIG_FILE.read_text())
     # Migrate legacy format: {token, cookie, team, user} → multi-workspace
     if "token" in config and "workspaces" not in config:
@@ -69,6 +71,27 @@ def load_config() -> dict:
         }
         save_config(config)
     return config
+
+
+def vault_config() -> dict:
+    """Config from the 1Password vault `Claudine` (Document 'slack-user-cli config.json'), when no local file exists.
+
+    Goes through `claudine-secret`, which authenticates with a read-only service
+    account and caches in the macOS Keychain, so nothing is stored in cleartext
+    on disk and no 1Password prompt appears. Returns {} when the helper or the
+    vault is unavailable, leaving the interactive login path untouched.
+    """
+    import shutil
+    import subprocess
+
+    helper = shutil.which("claudine-secret") or str(Path.home() / ".local" / "bin" / "claudine-secret")
+    try:
+        result = subprocess.run([helper, "document", VAULT_DOCUMENT], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    if result.returncode != 0 or not result.stdout.strip():
+        return {}
+    return json.loads(result.stdout)
 
 
 def save_config(config: dict) -> None:
