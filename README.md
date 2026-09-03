@@ -142,3 +142,15 @@ uv run tests/test_slack_user_cli.py
 
 WebClient and `slacktokens` are mocked throughout, so this never touches a
 real Slack workspace or the local Slack desktop app.
+
+
+## Credentials from the 1Password vault
+
+When `~/.config/slack-user-cli/config.json` is absent, the CLI reads the same file from the
+1Password vault `Claudine` (Document "slack-user-cli config.json") through the
+`claudine-secret` helper of the claudine repo. The helper authenticates with a
+read-only service account (token in the macOS Keychain, or
+`OP_SERVICE_ACCOUNT_TOKEN` on a server) and caches the value in the Keychain for
+a day, so no token sits in cleartext on disk and 1Password never prompts. After
+rotating the token in the vault, run `claudine-secret purge`. The interactive
+login still works and writes the local file, which then takes precedence.
