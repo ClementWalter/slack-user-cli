@@ -137,6 +137,12 @@ slack_user_cli channels --all
 slack_user_cli channels --type "public_channel,private_channel,mpim,im"
 slack_user_cli channels --json   # {channels: [{id, name, type, num_members, topic, is_member}, ...]}
 
+# 1:1 IMs cannot be enumerated: --type "im,mpim" returns Group DMs only, typed
+# "Group DM" (not "mpim"), named like mpdm-user.a--user.b--user.c-1. To find the
+# group DMs a given person is in, match their username stem against `name`;
+# filtering on type=="mpim" or on U… ids returns nothing.
+slack_user_cli channels --type "im,mpim" --json
+
 # Read recent messages from a channel (by name or ID; output: user IDs)
 slack_user_cli read <channel_name_or_id> --limit 20
 
@@ -167,9 +173,11 @@ slack_user_cli read <channel_name_or_id> --limit 20 --json --expand-thread
 
 # Time-bounded fetch: only messages at/after an ISO date or datetime (UTC if
 # no tz). Sets the history `oldest` bound; pair with a larger --limit to pull a
-# whole window.
-slack_user_cli read <channel_name_or_id> --since 2026-05-29 --limit 200 --json --expand-thread
-slack_user_cli read <channel_name_or_id> --since 2026-05-29T10:07:00 --limit 200 --json
+# whole window. --limit fills from the OLD end of the window: on a busy channel
+# --limit 200 over several days returns the oldest 200 and never reaches today,
+# which reads as a false quiet day. Use --limit 800 for a multi-day window.
+slack_user_cli read <channel_name_or_id> --since 2026-05-29 --limit 800 --json --expand-thread
+slack_user_cli read <channel_name_or_id> --since 2026-05-29T10:07:00 --limit 800 --json
 
 # Widen-then-filter, for a periodic digest's de-dup boundary: --since only
 # bounds parents server-side, so it misses a thread whose parent predates the
@@ -191,10 +199,12 @@ slack_user_cli url "https://workspace.slack.com/archives/C.../p..." --json
 
 # Canonical permalink(s) via chat.getPermalink — pass the channel + one or more
 # raw_ts. Unlike a hand-built /p<ts> URL, these are thread-aware (carry
-# thread_ts/cid) so they navigate correctly to threaded replies, not just roots.
-# ALWAYS use this to cite a message rather than constructing /p<ts> by hand.
-slack_user_cli permalink <channel_name_or_id> <raw_ts> [<raw_ts> ...]
-slack_user_cli permalink <channel_name_or_id> <raw_ts> --json   # {channel, permalinks: {ts: url}}
+# ?thread_ts=…&cid=…) so they navigate correctly to threaded replies, not just
+# roots. ALWAYS use this to cite a message rather than constructing /p<ts> by
+# hand, and pass the C… id rather than the name: a name lookup fails with
+# "Channel '<name>' not found" whenever that name is missing from the cache.
+slack_user_cli permalink <channel_id> <raw_ts> [<raw_ts> ...]
+slack_user_cli permalink <channel_id> <raw_ts> --json   # {channel, permalinks: {ts: url}}
 
 # List workspace members (output: user IDs)
 slack_user_cli users
@@ -250,12 +260,15 @@ slack_user_cli dm <user_name_or_id> "reply text" --thread <message_ts>
 slack_user_cli dm <user_name_or_id> "message" --json
 
 # Read DM history (omit message; output: user IDs). Same --json shape as `read`.
+# USER is a user handle or U… id, never a D… channel id; to read a 1:1 you only
+# know by its D… id, use `read <D…>` (which also accepts --since).
 slack_user_cli dm <user_name_or_id>
 slack_user_cli dm <user_name_or_id> --json
 
 # dm has no --since to widen from first (raise --limit instead so old-enough
 # parents are actually fetched), but --keep-since still drops any thread with
 # nothing at/after it and tags after_cutoff, same as `read --keep-since`.
+# Without --keep-since, filter on raw_ts client-side (--limit 40 covers ~2 days).
 slack_user_cli dm <user_name_or_id> --limit 40 --keep-since 2026-05-29 --json
 ```
 
@@ -497,8 +510,9 @@ Feb 27"), follow this procedure:
 
 ```bash
 # --since bounds the fetch server-side; --expand-thread inlines replies, and
-# --json gives you each message's raw_ts for citation.
-slack_user_cli read <channel_id> --since <start_date> --limit 200 --json --expand-thread
+# --json gives you each message's raw_ts for citation. --limit 800 so a busy
+# channel's window is not truncated at its old end (see Gotchas).
+slack_user_cli read <channel_id> --since <start_date> --limit 800 --json --expand-thread
 ```
 
 - Each message carries `raw_ts`; keep it for permalinks and for filtering on the
@@ -558,6 +572,49 @@ multiple threads, with columns: Issue | Impact | Status.
 - Watch for Slack API rate limits. If you hit `ratelimited`, wait a few seconds
   and retry.
 - For large channels, process threads in batches of 3-5 to avoid rate limits.
+
+## Gotchas
+
+- **Read and permalink by `C…` id, never by name.** A channel can be renamed
+  with its id unchanged; `resolve <id>` reads the no-TTL `id_names.json` store,
+  so it can serve the old name indefinitely, and a forced `refresh` hits the
+  throttled `conversations.list`. Keep a map of ids and pass them everywhere.
+  For batch name→id without touching the API, use
+  `resolve-name <names…> --cache-only --json` (misses report `null`).
+- **`--since` bounds only parent messages server-side.** A hot thread whose
+  parent predates `--since` is missed entirely. Either pass `--since` two-plus
+  days earlier and filter client-side on `raw_ts` (keep a thread when the parent
+  OR any reply is at/after the cutoff), or use `--keep-since`, which does exactly
+  that in one call.
+- **`--limit` fills from the old end of the window.** `--limit 200` on a busy
+  channel returns the oldest 200 and never reaches today, so every channel shows
+  messages but none recent (a false quiet day). Use `--limit 800` for a multi-day
+  window. An empty `messages` array, or one whose newest `raw_ts` clusters at the
+  window start, is suspect: re-pull with `--limit 800` and a wider `--since`,
+  then cross-check with a no-`--since` `read <CID> --limit 12`, which returns
+  the true newest messages and is the definitive quiet-channel test.
+- **DMs.** `dm <user>` has no `--since` (only `--limit`, `--json`, `--names`,
+  `--expand-thread`, `--keep-since`, `--blocks`); filter on `raw_ts` afterwards.
+  It takes a user handle or `U…` id, not a `D…` id; read a known 1:1 by its `D…`
+  id with `read <D…>`. The CLI cannot enumerate 1:1 IMs: `channels --type
+  "im,mpim"` returns Group DMs only, typed `"Group DM"` (not `"mpim"`), named
+  like `mpdm-user.a--user.b--user.c-1`. Match people by username stem against
+  that name, never by `U…` id.
+- **Permalinks.** `permalink <CID> <raw_ts> [<raw_ts>…] --json` returns
+  `{channel, permalinks: {ts: url}}` and is the only way to get thread-aware
+  reply permalinks (`?thread_ts=…&cid=…`); a hand-built `/p<ts>` URL resolves
+  only for root messages. Pass the channel id, not the name.
+- **`--json` message shape.** Every message carries `raw_ts` and, when threaded,
+  `thread_ts`; attachments are in `files[]`, a quoted/forwarded message in
+  `shared[]` (including its own `files`), pasted permalinks in `links[]`, and
+  thread replies in `replies[]` with `--expand-thread`.
+- **Transients, not failures.** `502 Bad Gateway` / `Tunnel connection failed`
+  come in bursts on a serialized pass (most channels fail, first and last
+  succeed) and recover on a second serial pass over the failed subset.
+  `CERTIFICATE_VERIFY_FAILED` appears under concurrent load and is resource
+  contention, not auth: re-run those calls serially. `ratelimited` / `429`: back
+  off (honor `Retry-After`) and retry; `conversations.list` throttles first.
+  Never fire reads in parallel.
 
 ## Troubleshooting
 
