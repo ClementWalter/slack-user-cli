@@ -48,13 +48,13 @@ console = Console()
 
 
 def load_config() -> dict:
-    """Load config from disk, returning empty dict if missing.
+    """Load vault credentials, retaining local configuration during outages.
 
     Migrates legacy single-workspace format to multi-workspace on read.
     """
-    if not CONFIG_FILE.exists():
-        return vault_config()
-    config = json.loads(CONFIG_FILE.read_text())
+    config = vault_config()
+    if not config:
+        config = json.loads(CONFIG_FILE.read_text()) if CONFIG_FILE.exists() else {}
     # Migrate legacy format: {token, cookie, team, user} → multi-workspace
     if "token" in config and "workspaces" not in config:
         team = config.get("team", "default")
@@ -73,31 +73,62 @@ def load_config() -> dict:
     return config
 
 
-def vault_config() -> dict:
-    """Config from the 1Password vault `Claudine` (Document 'slack-user-cli config.json'), when no local file exists.
-
-    Goes through `claudine-secret`, which authenticates with a read-only service
-    account and caches in the macOS Keychain, so nothing is stored in cleartext
-    on disk and no 1Password prompt appears. Returns {} when the helper or the
-    vault is unavailable, leaving the interactive login path untouched.
-    """
+def auth_broker(operation: str, config: dict | None = None) -> dict:
+    """Use the shared vault broker without exposing credentials in arguments."""
     import shutil
     import subprocess
 
-    helper = shutil.which("claudine-secret") or str(Path.home() / ".local" / "bin" / "claudine-secret")
+    helper = shutil.which("claudine-secret") or str(Path.home() / ".local/bin/claudine-secret")
+    args = [helper, "auth", operation, "slack"]
+    if operation == "status":
+        args.append("--json")
     try:
-        result = subprocess.run([helper, "document", VAULT_DOCUMENT], capture_output=True, text=True, timeout=60)
-    except (OSError, subprocess.TimeoutExpired):
+        result = subprocess.run(
+            args, input=json.dumps(config) if config is not None else None,
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode not in (0, 3) or not result.stdout.strip():
+            return {}
+        payload = json.loads(result.stdout)
+        if operation == "load" and result.returncode != 0:
+            return {}
+        return payload if isinstance(payload, dict) else {}
+    except (OSError, subprocess.TimeoutExpired, ValueError):
         return {}
-    if result.returncode != 0 or not result.stdout.strip():
-        return {}
-    return json.loads(result.stdout)
+
+
+def vault_config() -> dict:
+    """Prefer pending credentials and 1Password through the shared broker."""
+    # A login made while the broker was absent must not revert to stale vault data.
+    if CONFIG_FILE.with_suffix(".pending").exists() and CONFIG_FILE.exists():
+        return json.loads(CONFIG_FILE.read_text())
+    return auth_broker("load")
 
 
 def save_config(config: dict) -> None:
-    """Persist config to disk, creating parent dirs as needed."""
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_FILE.write_text(json.dumps(config, indent=2))
+    """Keep a protected working copy and sync successful login credentials."""
+    import os
+    import tempfile
+
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    marker = CONFIG_FILE.with_suffix(".pending")
+    marker.touch(mode=0o600)
+    # Atomic replacement prevents truncated credentials after a crash.
+    descriptor, temporary = tempfile.mkstemp(prefix=".auth-", dir=CONFIG_FILE.parent)
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            handle.write(json.dumps(config, indent=2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, CONFIG_FILE)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+    metadata = auth_broker("save", config)
+    if metadata.get("source") == "vault" and not metadata.get("pending"):
+        marker.unlink(missing_ok=True)
+    else:
+        logging.getLogger(__name__).warning("Login saved locally; 1Password synchronization is pending.")
+
 
 
 def get_workspace_config(config: dict, workspace: str | None) -> dict:
@@ -587,6 +618,8 @@ def cli(ctx: click.Context, debug: bool, workspace: str | None) -> None:
     # Resolve and store the active workspace name for cache keying
     ctx.ensure_object(dict)
     ctx.obj["workspace"] = workspace
+    if ctx.invoked_subcommand in {"auth-status", "auth-sync"}:
+        return
     config = load_config()
     ctx.obj["workspace_name"] = _get_active_workspace(config, workspace)
 
@@ -3523,6 +3556,40 @@ def _emit_messages_json(
     click.echo(
         json.dumps({"channel": channel, "messages": parsed}, ensure_ascii=False)
     )
+
+
+@cli.command("auth-status")
+@click.option("--json", "as_json", is_flag=True, help="Return credential metadata without secrets.")
+def auth_status(as_json: bool) -> None:
+    """Inspect vault synchronization. Example: auth-status --json."""
+    metadata = auth_broker("status") or {
+        "connector": "slack", "account": "default", "source": "unavailable",
+        "configured": False, "pending": False, "last_sync": None,
+    }
+    metadata["legacy_available"] = CONFIG_FILE.exists()
+    if CONFIG_FILE.with_suffix(".pending").exists():
+        metadata.update(source="pending", pending=True, configured=CONFIG_FILE.exists())
+    click.echo(json.dumps(metadata) if as_json else
+               f"{metadata['source']}; pending={metadata['pending']}; local={metadata['legacy_available']}")
+
+
+@cli.command("auth-sync")
+def auth_sync() -> None:
+    """Retry pending vault sync or import local credentials. Example: auth-sync."""
+    # Broker pending data is newer than any compatibility copy.
+    config = vault_config()
+    if not config and CONFIG_FILE.exists():
+        config = json.loads(CONFIG_FILE.read_text())
+    if not config:
+        raise click.ClickException("No credentials available to synchronize; connect this tool in Brain.")
+    metadata = auth_broker("save", config)
+    if not metadata:
+        raise click.ClickException("Credential broker unavailable; local login is preserved.")
+    if metadata.get("source") == "vault" and not metadata.get("pending"):
+        CONFIG_FILE.with_suffix(".pending").unlink(missing_ok=True)
+    click.echo(json.dumps(metadata))
+    if metadata.get("pending"):
+        raise click.exceptions.Exit(3)
 
 
 if __name__ == "__main__":
