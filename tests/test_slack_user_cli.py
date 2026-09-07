@@ -75,6 +75,7 @@ def runner():
 @pytest.fixture()
 def tmp_config(tmp_path, monkeypatch):
     """Redirect config to a temp directory so tests don't touch real config."""
+    monkeypatch.setattr("slack_user_cli.auth_broker", lambda *args: {})
     config_dir = tmp_path / ".config" / "slack-user-cli"
     config_file = config_dir / "config.json"
     monkeypatch.setattr("slack_user_cli.CONFIG_DIR", config_dir)
