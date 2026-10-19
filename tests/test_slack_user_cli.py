@@ -1973,6 +1973,30 @@ class TestSearchCommand:
         result = runner.invoke(cli, ["search", "query"])
         assert "42 total matches" in result.output
 
+    @patch("slack_user_cli.get_client")
+    def test_search_json_carries_raw_ts(
+        self, mock_get_client, runner, saved_config
+    ):
+        mock_client = MagicMock()
+        mock_client.search_messages.return_value = {
+            "messages": {
+                "total": 1,
+                "paging": {"page": 1, "pages": 1},
+                "matches": [
+                    {
+                        "user": "U1",
+                        "text": "found it",
+                        "channel": {"id": "C1"},
+                        "ts": "1777887012.881539",
+                    }
+                ],
+            }
+        }
+        mock_get_client.return_value = mock_client
+
+        result = runner.invoke(cli, ["search", "keyword", "--json"])
+        assert json.loads(result.output)["matches"][0]["raw_ts"] == "1777887012.881539"
+
 
 # -- Pagination tests ---------------------------------------------------------
 
