@@ -2885,6 +2885,9 @@ def search(
                 channel_field = channel.get("id", "")
             out.append({
                 "ts": _format_ts(match.get("ts", "")),
+                # Same full-precision ts as `read --json`, so callers can filter
+                # or pass it to `permalink`/`thread` without parsing permalinks.
+                "raw_ts": match.get("ts", ""),
                 "user": user_field,
                 "channel": channel_field,
                 "text": match.get("text", ""),

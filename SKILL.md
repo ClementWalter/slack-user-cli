@@ -394,6 +394,8 @@ When using `dm`, the USER argument must match the Slack **username** (e.g.
 # Search messages (output: raw user/channel IDs in user/channel fields)
 slack_user_cli search "query" --count 20 --page 1
 slack_user_cli search "query" --json
+# {"query", "page", "pages", "total", "matches": [{"ts", "raw_ts", "user", "channel", "text", "permalink"}, ...]}
+# `ts` is minute-precision UTC for humans; filter and sort on `raw_ts`.
 ```
 
 **Pull thread context via global search.** When asked to read or explain a
