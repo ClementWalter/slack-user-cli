@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlparse
@@ -2221,6 +2222,195 @@ def send(
         )
     else:
         console.print(f"[green]Message sent[/] (ts={ts})")
+
+
+# -- drafts -------------------------------------------------------------------
+
+_MENTION_RE = re.compile(r"<@(U[A-Z0-9]+)>")
+
+
+def _draft_blocks(text: str) -> list[dict]:
+    """Rich-text blocks for a draft; `<@U…>` becomes a real mention, not literal text."""
+    elements: list[dict] = []
+    pos = 0
+    for m in _MENTION_RE.finditer(text):
+        if m.start() > pos:
+            elements.append({"type": "text", "text": text[pos : m.start()]})
+        elements.append({"type": "user", "user_id": m.group(1)})
+        pos = m.end()
+    if pos < len(text):
+        elements.append({"type": "text", "text": text[pos:]})
+    return [{"type": "rich_text", "elements": [{"type": "rich_text_section", "elements": elements}]}]
+
+
+def _list_drafts(client: WebClient, limit: int = 100) -> list[dict]:
+    """Unsent drafts as drafts.list returns them."""
+    try:
+        resp = client.api_call("drafts.list", params={"is_active": "true", "limit": str(limit)})
+    except SlackApiError as exc:
+        raise click.ClickException(str(exc)) from exc
+    return [d for d in resp.get("drafts", []) if not d.get("is_sent") and not d.get("is_deleted")]
+
+
+def _delete_draft(client: WebClient, draft: dict) -> None:
+    """Delete a draft; Slack answers draft_has_conflict unless the client ts is newer than the draft's."""
+    try:
+        client.api_call(
+            "drafts.delete",
+            data={"draft_id": draft.get("id", ""), "client_last_updated_ts": f"{time.time():.6f}"},
+        )
+    except SlackApiError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+def _draft_text(draft: dict) -> str:
+    """Flatten a draft's rich-text blocks back to plain text."""
+    parts: list[str] = []
+    for block in draft.get("blocks", []):
+        for section in block.get("elements", []):
+            for el in section.get("elements", []):
+                if el.get("type") == "user":
+                    parts.append(f"<@{el.get('user_id', '')}>")
+                else:
+                    parts.append(el.get("text", ""))
+    return "".join(parts)
+
+
+@cli.command()
+@click.argument("channel")
+@click.argument("message")
+@click.option("--thread", "thread_ts", default=None, help="Draft a reply in this thread (message timestamp).")
+@click.option("--replace", is_flag=True, default=False, help="Overwrite the draft already sitting in that channel or thread.")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit structured JSON.")
+@click.pass_context
+def draft(
+    ctx: click.Context,
+    channel: str,
+    message: str,
+    thread_ts: str | None,
+    replace: bool,
+    as_json: bool,
+) -> None:
+    """Save MESSAGE as an unsent draft in CHANNEL (or a thread with --thread).
+
+    Nothing is posted: the draft lands in Slack's "Drafts & Sent", where it is
+    edited and sent by hand. `<@U…>` in MESSAGE becomes a real mention.
+
+    \b
+    Examples:
+      slack-user draft general "display bug only, nobody overpaid"
+      slack-user draft C0123456789 "<@U0123456789> both coexist" --thread 1793023566.123456
+    """
+    client = get_client(workspace=ctx.obj["workspace"])
+    ws = ctx.obj["workspace_name"]
+    channel_id = resolve_channel(client, channel, workspace=ws)
+
+    destination: dict = {"channel_id": channel_id}
+    if thread_ts:
+        destination.update(thread_ts=thread_ts, broadcast=False)
+
+    def create() -> dict:
+        # drafts.create is the internal endpoint the Slack client uses; it never posts.
+        return client.api_call(
+            "drafts.create",
+            data={
+                "client_msg_id": str(uuid.uuid4()),
+                "blocks": json.dumps(_draft_blocks(message)),
+                "destinations": json.dumps([destination]),
+                "file_ids": "[]",
+                "is_from_composer": "false",
+            },
+        )
+
+    try:
+        resp = create()
+    except SlackApiError as exc:
+        if exc.response.get("error") != "attached_draft_exists":
+            raise click.ClickException(str(exc)) from exc
+        # Slack keeps one draft per channel or thread.
+        existing = [
+            d
+            for d in _list_drafts(client)
+            if (d.get("destinations") or [{}])[0].get("channel_id") == channel_id
+            and (d.get("destinations") or [{}])[0].get("thread_ts") == thread_ts
+        ]
+        if not replace or not existing:
+            ids = ", ".join(d.get("id", "") for d in existing) or "unknown"
+            raise click.ClickException(
+                f"A draft already exists here ({ids}); pass --replace to overwrite it"
+            ) from exc
+        for d in existing:
+            _delete_draft(client, d)
+        try:
+            resp = create()
+        except SlackApiError as exc2:
+            raise click.ClickException(str(exc2)) from exc2
+
+    draft_id = resp.get("draft", {}).get("id", "")
+    if as_json:
+        click.echo(
+            json.dumps(
+                {"ok": True, "id": draft_id, "channel": channel_id, "thread_ts": thread_ts},
+                ensure_ascii=False,
+            )
+        )
+    else:
+        console.print(f"[green]Draft saved[/] (id={draft_id}), edit and send it from Drafts & Sent")
+
+
+@cli.command()
+@click.option("--limit", default=20, help="Number of drafts to show.")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit structured JSON.")
+@click.pass_context
+def drafts(ctx: click.Context, limit: int, as_json: bool) -> None:
+    """List unsent drafts, newest first: id, destination, text."""
+    client = get_client(workspace=ctx.obj["workspace"])
+    rows = []
+    for d in _list_drafts(client, limit):
+        dest = (d.get("destinations") or [{}])[0]
+        rows.append(
+            {
+                "id": d.get("id", ""),
+                "channel": dest.get("channel_id", ""),
+                "thread_ts": dest.get("thread_ts"),
+                "last_updated_ts": d.get("last_updated_ts", ""),
+                "text": _draft_text(d),
+            }
+        )
+
+    if as_json:
+        click.echo(json.dumps({"drafts": rows}, ensure_ascii=False))
+        return
+    table = Table(title="Drafts")
+    table.add_column("ID")
+    table.add_column("Channel")
+    table.add_column("Thread")
+    table.add_column("Text")
+    for r in rows:
+        table.add_row(r["id"], r["channel"], r["thread_ts"] or "", r["text"])
+    console.print(table)
+
+
+@cli.command(name="draft-delete")
+@click.argument("draft_ids", nargs=-1, required=True)
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit structured JSON.")
+@click.pass_context
+def draft_delete(ctx: click.Context, draft_ids: tuple[str, ...], as_json: bool) -> None:
+    """Delete one or more unsent drafts by id (from `drafts`)."""
+    client = get_client(workspace=ctx.obj["workspace"])
+    by_id = {d.get("id"): d for d in _list_drafts(client)}
+
+    deleted = []
+    for draft_id in draft_ids:
+        if draft_id not in by_id:
+            raise click.ClickException(f"Draft {draft_id} not found; list them with `slack-user drafts`")
+        _delete_draft(client, by_id[draft_id])
+        deleted.append(draft_id)
+
+    if as_json:
+        click.echo(json.dumps({"ok": True, "deleted": deleted}, ensure_ascii=False))
+    else:
+        console.print(f"[green]Deleted[/] {', '.join(deleted)}")
 
 
 # -- click (block-kit interactive) -------------------------------------------

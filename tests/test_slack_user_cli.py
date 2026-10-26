@@ -2785,3 +2785,192 @@ class TestDownloadQuotedMessage:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))
+
+
+# -- Drafts -------------------------------------------------------------------
+
+
+@pytest.fixture()
+def draft_client():
+    """Client stub whose channel cache knows #general and whose drafts.create answers."""
+    client = MagicMock()
+    client.conversations_list.return_value = {
+        "channels": [{"id": "C1", "name": "general"}],
+        "response_metadata": {"next_cursor": ""},
+    }
+    client.api_call.return_value = {"ok": True, "draft": {"id": "Dr1"}}
+    return client
+
+
+@pytest.fixture()
+def listed_drafts():
+    """drafts.list payload: one thread draft with a mention, one sent draft."""
+    return {
+        "ok": True,
+        "drafts": [
+            {
+                "id": "Dr1",
+                "last_updated_ts": "10.5",
+                "is_sent": False,
+                "is_deleted": False,
+                "destinations": [{"channel_id": "C1", "thread_ts": "9.1", "broadcast": False}],
+                "blocks": [
+                    {
+                        "type": "rich_text",
+                        "elements": [
+                            {
+                                "type": "rich_text_section",
+                                "elements": [
+                                    {"type": "user", "user_id": "U1"},
+                                    {"type": "text", "text": " ok"},
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            },
+            {"id": "Dr2", "last_updated_ts": "11.0", "is_sent": True, "destinations": [{}], "blocks": []},
+        ],
+    }
+
+
+class TestDraftBlocks:
+    def test_plain_text_is_one_text_element(self):
+        from slack_user_cli import _draft_blocks
+
+        assert _draft_blocks("hi")[0]["elements"][0]["elements"] == [{"type": "text", "text": "hi"}]
+
+    def test_mention_becomes_user_element(self):
+        from slack_user_cli import _draft_blocks
+
+        assert _draft_blocks("<@U12AB> yes")[0]["elements"][0]["elements"][0] == {"type": "user", "user_id": "U12AB"}
+
+    def test_text_after_mention_is_kept(self):
+        from slack_user_cli import _draft_blocks
+
+        assert _draft_blocks("<@U12AB> yes")[0]["elements"][0]["elements"][1] == {"type": "text", "text": " yes"}
+
+
+class TestDraftCommand:
+    @patch("slack_user_cli.get_client")
+    def test_draft_calls_drafts_create(self, mock_get_client, draft_client, runner, saved_config):
+        mock_get_client.return_value = draft_client
+        runner.invoke(cli, ["draft", "general", "hello"])
+        assert draft_client.api_call.call_args.args[0] == "drafts.create"
+
+    @patch("slack_user_cli.get_client")
+    def test_draft_never_posts(self, mock_get_client, draft_client, runner, saved_config):
+        mock_get_client.return_value = draft_client
+        runner.invoke(cli, ["draft", "general", "hello"])
+        draft_client.chat_postMessage.assert_not_called()
+
+    @patch("slack_user_cli.get_client")
+    def test_draft_targets_resolved_channel(self, mock_get_client, draft_client, runner, saved_config):
+        mock_get_client.return_value = draft_client
+        runner.invoke(cli, ["draft", "general", "hello"])
+        destinations = json.loads(draft_client.api_call.call_args.kwargs["data"]["destinations"])
+        assert destinations == [{"channel_id": "C1"}]
+
+    @patch("slack_user_cli.get_client")
+    def test_draft_thread_sets_thread_ts(self, mock_get_client, draft_client, runner, saved_config):
+        mock_get_client.return_value = draft_client
+        runner.invoke(cli, ["draft", "general", "hello", "--thread", "9.1"])
+        destinations = json.loads(draft_client.api_call.call_args.kwargs["data"]["destinations"])
+        assert destinations == [{"channel_id": "C1", "thread_ts": "9.1", "broadcast": False}]
+
+    @patch("slack_user_cli.get_client")
+    def test_draft_json_reports_id(self, mock_get_client, draft_client, runner, saved_config):
+        mock_get_client.return_value = draft_client
+        result = runner.invoke(cli, ["draft", "general", "hello", "--json"])
+        assert json.loads(result.output)["id"] == "Dr1"
+
+
+class TestDraftsCommand:
+    @patch("slack_user_cli.get_client")
+    def test_drafts_skips_sent(self, mock_get_client, mock_client, listed_drafts, runner, saved_config):
+        mock_client.api_call.return_value = listed_drafts
+        mock_get_client.return_value = mock_client
+        result = runner.invoke(cli, ["drafts", "--json"])
+        assert [d["id"] for d in json.loads(result.output)["drafts"]] == ["Dr1"]
+
+    @patch("slack_user_cli.get_client")
+    def test_drafts_flattens_mentions(self, mock_get_client, mock_client, listed_drafts, runner, saved_config):
+        mock_client.api_call.return_value = listed_drafts
+        mock_get_client.return_value = mock_client
+        result = runner.invoke(cli, ["drafts", "--json"])
+        assert json.loads(result.output)["drafts"][0]["text"] == "<@U1> ok"
+
+    @patch("slack_user_cli.get_client")
+    def test_drafts_reports_thread(self, mock_get_client, mock_client, listed_drafts, runner, saved_config):
+        mock_client.api_call.return_value = listed_drafts
+        mock_get_client.return_value = mock_client
+        result = runner.invoke(cli, ["drafts", "--json"])
+        assert json.loads(result.output)["drafts"][0]["thread_ts"] == "9.1"
+
+
+class TestDraftDeleteCommand:
+    @patch("slack_user_cli.get_client")
+    def test_delete_targets_draft_id(self, mock_get_client, mock_client, listed_drafts, runner, saved_config):
+        mock_client.api_call.return_value = listed_drafts
+        mock_get_client.return_value = mock_client
+        runner.invoke(cli, ["draft-delete", "Dr1"])
+        assert mock_client.api_call.call_args.kwargs["data"]["draft_id"] == "Dr1"
+
+    @patch("slack_user_cli.get_client")
+    def test_delete_client_ts_is_newer_than_draft(self, mock_get_client, mock_client, listed_drafts, runner, saved_config):
+        mock_client.api_call.return_value = listed_drafts
+        mock_get_client.return_value = mock_client
+        runner.invoke(cli, ["draft-delete", "Dr1"])
+        assert float(mock_client.api_call.call_args.kwargs["data"]["client_last_updated_ts"]) > 10.5
+
+    @patch("slack_user_cli.get_client")
+    def test_delete_unknown_id_fails(self, mock_get_client, mock_client, listed_drafts, runner, saved_config):
+        mock_client.api_call.return_value = listed_drafts
+        mock_get_client.return_value = mock_client
+        result = runner.invoke(cli, ["draft-delete", "DrNOPE"])
+        assert result.exit_code != 0
+
+
+@pytest.fixture()
+def occupied_client(listed_drafts):
+    """Client stub where #general's thread 9.1 already holds draft Dr1."""
+    client = MagicMock()
+    client.conversations_list.return_value = {
+        "channels": [{"id": "C1", "name": "general"}],
+        "response_metadata": {"next_cursor": ""},
+    }
+    occupied = [True]
+
+    def api_call(method, **kwargs):
+        if method == "drafts.list":
+            return listed_drafts
+        if method == "drafts.delete":
+            occupied[0] = False
+            return {"ok": True}
+        if occupied[0]:
+            raise SlackApiError("exists", {"ok": False, "error": "attached_draft_exists"})
+        return {"ok": True, "draft": {"id": "Dr9"}}
+
+    client.api_call.side_effect = api_call
+    return client
+
+
+class TestDraftReplace:
+    @patch("slack_user_cli.get_client")
+    def test_occupied_without_replace_fails(self, mock_get_client, occupied_client, runner, saved_config):
+        mock_get_client.return_value = occupied_client
+        result = runner.invoke(cli, ["draft", "general", "hi", "--thread", "9.1"])
+        assert "--replace" in result.output
+
+    @patch("slack_user_cli.get_client")
+    def test_replace_deletes_existing(self, mock_get_client, occupied_client, runner, saved_config):
+        mock_get_client.return_value = occupied_client
+        runner.invoke(cli, ["draft", "general", "hi", "--thread", "9.1", "--replace"])
+        deleted = [c.kwargs["data"]["draft_id"] for c in occupied_client.api_call.call_args_list if c.args[0] == "drafts.delete"]
+        assert deleted == ["Dr1"]
+
+    @patch("slack_user_cli.get_client")
+    def test_replace_creates_new_draft(self, mock_get_client, occupied_client, runner, saved_config):
+        mock_get_client.return_value = occupied_client
+        result = runner.invoke(cli, ["draft", "general", "hi", "--thread", "9.1", "--replace", "--json"])
+        assert json.loads(result.output)["id"] == "Dr9"

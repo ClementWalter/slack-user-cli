@@ -272,6 +272,27 @@ slack_user_cli dm <user_name_or_id> --json
 slack_user_cli dm <user_name_or_id> --limit 40 --keep-since 2026-05-29 --json
 ```
 
+### Drafts (prepare without sending)
+
+`draft` saves an unsent message in Slack's "Drafts & Sent", in a channel or a
+thread. Nothing is posted and nobody else sees it: the user opens it, edits it
+and sends it himself. Prefer it over `send` whenever a reply is prepared for
+the user, since no approval is needed to create a draft. `<@U…>` in the text
+becomes a real mention.
+
+```bash
+slack_user_cli draft <channel_name_or_id> "reply text"
+slack_user_cli draft <channel_name_or_id> "reply text" --thread <message_ts>
+slack_user_cli draft <channel_id> "<@U0123456789> both coexist" --thread <message_ts> --json   # {ok, id, channel, thread_ts}
+
+# Slack keeps ONE draft per channel and per thread: a second draft there fails
+# naming the existing id, unless --replace overwrites it.
+slack_user_cli draft <channel> "new text" --thread <message_ts> --replace
+
+slack_user_cli drafts --json        # {drafts: [{id, channel, thread_ts, last_updated_ts, text}]}
+slack_user_cli draft-delete <draft_id> [<draft_id> …]
+```
+
 ### Clicking Block-Kit Buttons
 
 `read --json` surfaces interactive elements alongside the text. When a bot
