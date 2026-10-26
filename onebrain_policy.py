@@ -18,7 +18,7 @@ READS = {
     "whatsapp": {"status", "list", "chats", "read", "download", "pull", "sync", "listen"},
     "telegram": {"whoami", "chats", "read", "search", "download", "folders", "folder", "listen"},
     "email": {"accounts", "mailboxes", "list", "search", "read", "attachments", "auth status"},
-    "slack": {"whoami", "workspaces", "channels", "read", "thread", "search", "users", "info", "canvas", "download", "permalink", "resolve", "resolve-name"},
+    "slack": {"whoami", "workspaces", "channels", "read", "thread", "search", "users", "info", "canvas", "download", "permalink", "resolve", "resolve-name", "drafts"},
     "gdrive": {"whoami", "auth list", "auth status", "drive search", "drive ls", "drive get", "drive comments", "drive download", "docs read", "sheets read", "sheets info"},
     "notion": {"whoami", "search", "page", "pages", "query", "comments", "resolve", "schema", "templates", "users"},
     "deezer": {"whoami", "album", "artist", "artist-radio", "artist-related", "artist-top", "chart", "download", "export-likes", "flow", "genres", "history", "likes", "playlist", "playlists", "resolve", "search", "track"},

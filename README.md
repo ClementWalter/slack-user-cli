@@ -116,6 +116,8 @@ slack_user_cli download <channel> <message_ts> --list
 slack_user_cli send <channel> "message text"
 slack_user_cli send <channel> "reply" --thread <message_ts>
 slack_user_cli dm <user> "message text"
+slack_user_cli draft <channel> "reply" --thread <message_ts>   # unsent, finish it in Slack
+slack_user_cli drafts
 slack_user_cli upload <channel> /path/to/file.png --message "caption"
 ```
 
