@@ -1,9 +1,29 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11,<3.12"  # leveldb 0.201 (via slacktokens) uses PyUnicode_AS_UNICODE, removed in 3.12
+# dependencies = [
+#     "pytest==9.1.1",
+#     "slack-sdk==3.41.0",
+#     "slacktokens==0.2.6",
+#     "click==8.3.2",
+#     "rich==14.3.3",
+#     "requests==2.33.1",
+# ]
+#
+# [tool.uv]
+# exclude-newer = "2026-10-27T00:00:00Z"
+# ///
 """Credential precedence and safe synchronization through the shared vault broker."""
 
 import json
 import subprocess
+import sys
+from pathlib import Path
 
-import slack_user_cli as cli
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import slack_user_cli as cli  # noqa: E402
 
 
 def completed(stdout: str, code: int = 0) -> subprocess.CompletedProcess:
@@ -133,3 +153,7 @@ def test_auth_status_process_works_without_login(tmp_path):
         capture_output=True, text=True, timeout=15, env=env,
     )
     assert (result.returncode, json.loads(result.stdout)["source"]) == (0, "vault")
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, *sys.argv[1:]]))
