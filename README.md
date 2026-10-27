@@ -1,5 +1,7 @@
 # slack-user-cli
 
+**Visibility: public.**
+
 Terminal access to Slack using browser session credentials (`xoxc-` token + `d`
 cookie). No Slack app registration, no OAuth flow — it reuses the credentials
 already on your machine from the Slack desktop app or browser session.
@@ -139,7 +141,7 @@ new channels or when lookups return IDs instead of names.
 The test suite is a self-contained `uv` script, same as the CLI itself:
 
 ```bash
-uv run tests/test_slack_user_cli.py
+for f in tests/test_*.py; do uv run --script "$f"; done
 ```
 
 WebClient and `slacktokens` are mocked throughout, so this never touches a

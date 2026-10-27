@@ -2,12 +2,15 @@
 # /// script
 # requires-python = ">=3.11,<3.12"  # leveldb 0.201 (via slacktokens) uses PyUnicode_AS_UNICODE, removed in 3.12
 # dependencies = [
-#     "slack-sdk>=3.33",
-#     "slacktokens>=0.2.6",
-#     "click>=8.0",
-#     "rich>=13.0",
-#     "requests>=2.31",
+#     "slack-sdk==3.41.0",
+#     "slacktokens==0.2.6",
+#     "click==8.3.2",
+#     "rich==14.3.3",
+#     "requests==2.33.1",
 # ]
+#
+# [tool.uv]
+# exclude-newer = "2026-10-27T00:00:00Z"
 # ///
 """Slack User CLI — terminal access to Slack using browser session credentials.
 
@@ -601,7 +604,7 @@ def _html_to_text(html: str) -> str:
 # -- CLI group ----------------------------------------------------------------
 
 
-@click.group()
+@click.group(epilog="\b\nExamples:\n  slack-user channels --json\n  slack-user read general --limit 20 --json\n  slack-user -w \"Other Workspace\" search \"release\" --json")
 @click.option(
     "--debug", is_flag=True, default=False, help="Enable debug logging."
 )
@@ -628,7 +631,7 @@ def cli(ctx: click.Context, debug: bool, workspace: str | None) -> None:
 # -- login --------------------------------------------------------------------
 
 
-@cli.command()
+@cli.command(epilog="\b\nExamples:\n  slack-user login auto\n  slack-user login --auto\n  slack-user login browser\n  slack-user login manual --workspace-name \"Acme\"")
 @click.argument(
     "mode",
     required=False,
@@ -664,13 +667,6 @@ def login(
 
     MODE is auto (default), browser, or manual. Flags (--auto, --browser,
     --manual) are aliases for the same modes.
-
-    \b
-    Examples:
-      slack-user login auto
-      slack-user login --auto
-      slack-user login browser
-      slack-user login manual
     """
     selected = {m.lower() for m in (mode, mode_flag) if m}
     if len(selected) > 1:
@@ -1073,7 +1069,7 @@ def _choose_default(teams: list[str]) -> str:
 # -- whoami -------------------------------------------------------------------
 
 
-@cli.command()
+@cli.command(epilog="\b\nExamples:\n  slack-user whoami\n  slack-user whoami --json")
 @click.option(
     "--json",
     "as_json",
@@ -1123,7 +1119,7 @@ def whoami(ctx: click.Context, as_json: bool) -> None:
 # -- workspaces ---------------------------------------------------------------
 
 
-@cli.command()
+@cli.command(epilog="\b\nExamples:\n  slack-user workspaces\n  slack-user workspaces --json")
 @click.option(
     "--json",
     "as_json",
@@ -1169,7 +1165,7 @@ def workspaces(as_json: bool) -> None:
     console.print("[dim]Use -w <name> to switch workspace for a command.[/]")
 
 
-@cli.command()
+@cli.command(epilog="\b\nExamples:\n  slack-user default \"Acme\"")
 @click.argument("name")
 @click.option(
     "--json",
@@ -1195,7 +1191,7 @@ def default(name: str, as_json: bool) -> None:
         console.print(f"[green]Default workspace set to [bold]{name}[/bold][/]")
 
 
-@cli.command()
+@cli.command(epilog="\b\nExamples:\n  slack-user refresh\n  slack-user refresh --json")
 @click.option(
     "--json",
     "as_json",
@@ -1232,7 +1228,7 @@ def refresh(ctx: click.Context, as_json: bool) -> None:
         console.print("[green]Cache refreshed.[/]")
 
 
-@cli.command()
+@cli.command(epilog="\b\nExamples:\n  slack-user resolve C0123456789 U0123456789\n  slack-user resolve C0123456789 U0123456789 --json")
 @click.argument("ids", nargs=-1, required=True)
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit structured JSON.")
 @click.pass_context
@@ -1263,7 +1259,7 @@ def resolve(ctx: click.Context, ids: tuple[str, ...], as_json: bool) -> None:
             console.print(f"{_id} → [bold]{name}[/]{mark}")
 
 
-@cli.command(name="resolve-name")
+@cli.command(name="resolve-name", epilog="\b\nExamples:\n  slack-user resolve-name engineering marketing --json\n  slack-user resolve-name alex --type user --cache-only --json")
 @click.argument("names", nargs=-1, required=True)
 @click.option(
     "--type",
@@ -1341,7 +1337,7 @@ def resolve_name(
 # -- channels -----------------------------------------------------------------
 
 
-@cli.command()
+@cli.command(epilog="\b\nExamples:\n  slack-user channels\n  slack-user channels --all --json\n  slack-user channels --type \"im,mpim\" --json")
 @click.option(
     "--type",
     "channel_types",
@@ -1452,7 +1448,7 @@ def _channel_type_label(ch: dict) -> str:
 # -- read ---------------------------------------------------------------------
 
 
-@cli.command()
+@cli.command(epilog="\b\nExamples:\n  slack-user read general --limit 20\n  slack-user read C0123456789 --limit 20 --json --expand-thread\n  slack-user read C0123456789 --since 2026-05-29 --limit 800 --json --expand-thread\n  slack-user read C0123456789 --since 2026-05-27 --keep-since 2026-05-29 --limit 800 --json\n  slack-user read C0123456789 --json --blocks")
 @click.argument("channel")
 @click.option("--limit", default=20, help="Number of messages to show.")
 @click.option(
@@ -1639,7 +1635,7 @@ def _fetch_thread_replies(
 # -- thread -------------------------------------------------------------------
 
 
-@cli.command()
+@cli.command(epilog="\b\nExamples:\n  slack-user thread C0123456789 1777887012.881539\n  slack-user thread C0123456789 1777887012.881539 --json --names\n  slack-user thread --dm alex 1777887012.881539")
 @click.argument("channel")
 @click.argument("ts")
 @click.option("--limit", default=50, help="Number of replies to show.")
@@ -1730,7 +1726,7 @@ def thread(
 # -- url (permalink reader) ---------------------------------------------------
 
 
-@cli.command(name="url")
+@cli.command(name="url", epilog="\b\nExamples:\n  slack-user url \"https://acme.slack.com/archives/C0123456789/p1777887012881539\"\n  slack-user url \"https://acme.slack.com/archives/C0123456789/p1777887012881539\" --json")
 @click.argument("slack_url")
 @click.option("--limit", default=50, help="Number of messages to show.")
 @click.option(
@@ -1811,7 +1807,7 @@ def url_command(
 # -- download -----------------------------------------------------------------
 
 
-@cli.command()
+@cli.command(epilog="\b\nExamples:\n  slack-user download \"https://acme.slack.com/archives/C0123456789/p1777887012881539\" -o ./out\n  slack-user download C0123456789 1777887012.881539 --list --json\n  slack-user download F0123456789 -o ./out")
 @click.argument("target")
 @click.argument("ts", required=False)
 @click.option(
@@ -1933,7 +1929,7 @@ def download(
 # -- permalink ----------------------------------------------------------------
 
 
-@cli.command()
+@cli.command(epilog="\b\nExamples:\n  slack-user permalink C0123456789 1777887012.881539\n  slack-user permalink C0123456789 1777887012.881539 1777887099.000100 --json")
 @click.argument("channel")
 @click.argument("ts", nargs=-1, required=True)
 @click.option(
@@ -1986,7 +1982,7 @@ def permalink(
 # -- users --------------------------------------------------------------------
 
 
-@cli.command()
+@cli.command(epilog="\b\nExamples:\n  slack-user users\n  slack-user users --json")
 @click.option(
     "--json",
     "as_json",
@@ -2068,7 +2064,7 @@ def users(ctx: click.Context, as_json: bool, with_names: bool) -> None:
 # -- user-channels ------------------------------------------------------------
 
 
-@cli.command(name="user-channels")
+@cli.command(name="user-channels", epilog="\b\nExamples:\n  slack-user user-channels alex\n  slack-user user-channels U0123456789 --type \"public_channel,private_channel,mpim\" --json")
 @click.argument("user")
 @click.option(
     "--type",
@@ -2180,7 +2176,7 @@ def user_channels(
 # -- send ---------------------------------------------------------------------
 
 
-@cli.command()
+@cli.command(epilog="\b\nExamples:\n  slack-user send general \"message text\"\n  slack-user send C0123456789 \"reply text\" --thread 1777887012.881539")
 @click.argument("channel")
 @click.argument("message")
 @click.option("--thread", "thread_ts", default=None, help="Reply in thread (message timestamp).")
@@ -2276,7 +2272,7 @@ def _draft_text(draft: dict) -> str:
     return "".join(parts)
 
 
-@cli.command()
+@cli.command(epilog="\b\nExamples:\n  slack-user draft general \"display bug only, nobody overpaid\"\n  slack-user draft C0123456789 \"<@U0123456789> both coexist\" --thread 1777887012.881539\n  slack-user draft C0123456789 \"reply text\" --thread 1777887012.881539\n  slack-user draft C0123456789 \"new text\" --thread 1777887012.881539 --replace --json")
 @click.argument("channel")
 @click.argument("message")
 @click.option("--thread", "thread_ts", default=None, help="Draft a reply in this thread (message timestamp).")
@@ -2295,11 +2291,6 @@ def draft(
 
     Nothing is posted: the draft lands in Slack's "Drafts & Sent", where it is
     edited and sent by hand. `<@U…>` in MESSAGE becomes a real mention.
-
-    \b
-    Examples:
-      slack-user draft product-vaults "display bug only, nobody overpaid"
-      slack-user draft C0ADHDQ3QH1 "<@U092QPMHQM7> both coexist" --thread 1793023566.123456
     """
     client = get_client(workspace=ctx.obj["workspace"])
     ws = ctx.obj["workspace_name"]
@@ -2358,7 +2349,7 @@ def draft(
         console.print(f"[green]Draft saved[/] (id={draft_id}), edit and send it from Drafts & Sent")
 
 
-@cli.command()
+@cli.command(epilog="\b\nExamples:\n  slack-user drafts\n  slack-user drafts --limit 5 --json")
 @click.option("--limit", default=20, help="Number of drafts to show.")
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit structured JSON.")
 @click.pass_context
@@ -2391,7 +2382,7 @@ def drafts(ctx: click.Context, limit: int, as_json: bool) -> None:
     console.print(table)
 
 
-@cli.command(name="draft-delete")
+@cli.command(name="draft-delete", epilog="\b\nExamples:\n  slack-user draft-delete Dr0123456789\n  slack-user draft-delete Dr0123456789 Dr0123456790 --json")
 @click.argument("draft_ids", nargs=-1, required=True)
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit structured JSON.")
 @click.pass_context
@@ -2598,7 +2589,7 @@ def _dispatch_block_action(
     if not token or not cookie:
         raise click.ClickException("Not logged in. Run 'login' first.")
 
-    # `service_team_id` must be the Slack team ID (e.g. TFM7VTADR), not the
+    # `service_team_id` must be the Slack team ID (e.g. T0123456789), not the
     # workspace slug stored in our config. auth.test is the canonical source.
     auth = client.auth_test().data
     team_id = auth.get("team_id", "")
@@ -2647,7 +2638,7 @@ def _dispatch_block_action(
         ) from exc
 
 
-@cli.command(name="click")
+@cli.command(name="click", epilog="\b\nExamples:\n  slack-user click C0123456789 1777887012.881539 --option \"The first one!\"\n  slack-user click C0123456789 1777887012.881539 --index 2 --json")
 @click.argument("channel")
 @click.argument("message_ts")
 @click.option(
@@ -2735,7 +2726,7 @@ def click_cmd(
 # -- upload -------------------------------------------------------------------
 
 
-@cli.command()
+@cli.command(epilog="\b\nExamples:\n  slack-user upload general report.pdf\n  slack-user upload C0123456789 report.pdf --message \"Here is the report\" --title \"Q1 Report\" --thread 1777887012.881539")
 @click.argument("channel")
 @click.argument("file_path", type=click.Path(exists=True))
 @click.option("--thread", "thread_ts", default=None, help="Upload in thread.")
@@ -2791,7 +2782,7 @@ def upload(
 # -- dm -----------------------------------------------------------------------
 
 
-@cli.command()
+@cli.command(epilog="\b\nExamples:\n  slack-user dm alex\n  slack-user dm alex \"message text\"\n  slack-user dm U0123456789 \"reply text\" --thread 1777887012.881539\n  slack-user dm alex --limit 40 --keep-since 2026-05-29 --json")
 @click.argument("user")
 @click.argument("message", required=False, default=None)
 @click.option("--limit", default=20, help="Messages to show when reading.")
@@ -2921,7 +2912,7 @@ def dm(
 # -- dm-upload ----------------------------------------------------------------
 
 
-@cli.command(name="dm-upload")
+@cli.command(name="dm-upload", epilog="\b\nExamples:\n  slack-user dm-upload alex report.pdf\n  slack-user dm-upload alex report.pdf --message \"See attached\" --thread 1777887012.881539")
 @click.argument("user")
 @click.argument("file_path", type=click.Path(exists=True))
 @click.option("--thread", "thread_ts", default=None, help="Upload in thread.")
@@ -3022,7 +3013,7 @@ def _resolve_user_by_name(
 # -- search -------------------------------------------------------------------
 
 
-@cli.command()
+@cli.command(epilog="\b\nExamples:\n  slack-user search \"release\" --count 20 --page 1\n  slack-user search \"from:alex in:#general\" --json")
 @click.argument("query")
 @click.option("--count", default=20, help="Results per page.")
 @click.option("--page", default=1, help="Page number.")
@@ -3126,7 +3117,7 @@ def search(
 # -- canvas -------------------------------------------------------------------
 
 
-@cli.command()
+@cli.command(epilog="\b\nExamples:\n  slack-user canvas \"https://acme.slack.com/docs/T0123456789/F0123456789\"\n  slack-user canvas F0123456789 --json\n  slack-user canvas \"https://acme.slack.com/docs/T0123456789/F0123456789\" --html")
 @click.argument("canvas_url_or_id")
 @click.option("--html", "raw_html", is_flag=True, default=False, help="Output raw HTML instead of plain text.")
 @click.option(
@@ -3172,7 +3163,7 @@ def canvas(
         console.print(text)
 
 
-@cli.command("canvas-edit")
+@cli.command("canvas-edit", epilog="\b\nExamples:\n  slack-user canvas-edit F0123456789 \"## New Section\"\n  slack-user canvas-edit F0123456789 \"## Fresh Start\" --operation replace\n  slack-user canvas-edit F0123456789 \"## Header\" --operation insert_at_start\n  cat summary.md | slack-user canvas-edit F0123456789 --operation replace")
 @click.argument("canvas_url_or_id")
 @click.argument("content", required=False)
 @click.option(
@@ -3209,17 +3200,6 @@ def canvas_edit(
 
     Content can be passed as an argument or piped via stdin.
     Accepts markdown — Slack converts it to canvas formatting.
-
-    Examples:
-
-        # Append markdown to a canvas
-        slack_user_cli canvas-edit DEADBEEFUUV "## New Section\\nSome text"
-
-        # Replace entire canvas content
-        slack_user_cli canvas-edit DEADBEEFUUV "## Fresh Start" --operation replace
-
-        # Pipe content from a file
-        cat summary.md | slack_user_cli canvas-edit DEADBEEFUUV --operation replace
     """
     import sys  # noqa: PLC0415
 
@@ -3751,7 +3731,7 @@ def _emit_messages_json(
     )
 
 
-@cli.command("auth-status")
+@cli.command("auth-status", epilog="\b\nExamples:\n  slack-user auth-status\n  slack-user auth-status --json")
 @click.option("--json", "as_json", is_flag=True, help="Return credential metadata without secrets.")
 def auth_status(as_json: bool) -> None:
     """Inspect vault synchronization. Example: auth-status --json."""
@@ -3766,7 +3746,7 @@ def auth_status(as_json: bool) -> None:
                f"{metadata['source']}; pending={metadata['pending']}; local={metadata['legacy_available']}")
 
 
-@cli.command("auth-sync")
+@cli.command("auth-sync", epilog="\b\nExamples:\n  slack-user auth-sync")
 def auth_sync() -> None:
     """Retry pending vault sync or import local credentials. Example: auth-sync."""
     # Broker pending data is newer than any compatibility copy.
@@ -3774,7 +3754,7 @@ def auth_sync() -> None:
     if not config and CONFIG_FILE.exists():
         config = json.loads(CONFIG_FILE.read_text())
     if not config:
-        raise click.ClickException("No credentials available to synchronize; connect this tool in Brain.")
+        raise click.ClickException("No credentials available to synchronize; run `slack-user login`.")
     metadata = auth_broker("save", config)
     if not metadata:
         raise click.ClickException("Credential broker unavailable; local login is preserved.")
@@ -3784,13 +3764,6 @@ def auth_sync() -> None:
     if metadata.get("pending"):
         raise click.exceptions.Exit(3)
 
-
-# Provider commands share the same execution policy as the app and MCP.
-from pathlib import Path as _PolicyPath
-import sys as _policy_sys
-_policy_sys.path.insert(0, str(_PolicyPath(__file__).resolve().parent))
-from onebrain_policy import install as _install_onebrain_policy
-_install_onebrain_policy(cli, 'slack')
 
 if __name__ == "__main__":
     cli()

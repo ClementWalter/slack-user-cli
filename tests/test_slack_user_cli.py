@@ -1,14 +1,17 @@
-#!/usr/bin/env -S uv run
+#!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11,<3.12"  # leveldb 0.201 (via slacktokens) uses PyUnicode_AS_UNICODE, removed in 3.12
 # dependencies = [
-#     "pytest>=8.0",
-#     "slack-sdk>=3.33",
-#     "slacktokens>=0.2.6",
-#     "click>=8.0",
-#     "rich>=13.0",
-#     "requests>=2.31",
+#     "pytest==9.1.1",
+#     "slack-sdk==3.41.0",
+#     "slacktokens==0.2.6",
+#     "click==8.3.2",
+#     "rich==14.3.3",
+#     "requests==2.33.1",
 # ]
+#
+# [tool.uv]
+# exclude-newer = "2026-10-27T00:00:00Z"
 # ///
 """Unit tests for slack_user_cli.py.
 
@@ -2654,9 +2657,9 @@ class TestDownloadCommand:
     @patch("slack_user_cli.get_client")
     def test_file_id_uses_files_info(self, mock_get_client, runner, saved_config):
         mock_client = MagicMock()
-        mock_client.api_call.return_value = {"file": {"id": "F0B883G50V6", "name": "m.pdf"}}
+        mock_client.api_call.return_value = {"file": {"id": "F0123456789", "name": "m.pdf"}}
         mock_get_client.return_value = mock_client
-        runner.invoke(cli, ["download", "F0B883G50V6", "--list"])
+        runner.invoke(cli, ["download", "F0123456789", "--list"])
         assert mock_client.api_call.call_args[0][0] == "files.info"
 
     @patch("requests.get")
