@@ -2,6 +2,8 @@
 
 **Visibility: public.**
 
+**Extension: not shipped** as a Claude Desktop extension: Claude already has an official Slack connector; this CLI stays a terminal tool for agents.
+
 Terminal access to Slack using browser session credentials (`xoxc-` token + `d`
 cookie). No Slack app registration, no OAuth flow — it reuses the credentials
 already on your machine from the Slack desktop app or browser session.
