@@ -554,6 +554,12 @@ def _fetch_canvas_content(client: WebClient, file_id: str) -> tuple[str, str]:
     file_info = resp.get("file", {})
     title = file_info.get("title", "Untitled")
     url_private = file_info.get("url_private")
+    # Canvases (huddle notes included) are Quip docs; other files are binary.
+    if file_info.get("filetype", "quip") != "quip":
+        raise click.ClickException(
+            f"{file_id} is a {file_info.get('pretty_type') or file_info.get('filetype')} file, "
+            "not a canvas. Save it with `slack-user download <channel> <ts>`."
+        )
 
     if not url_private:
         raise click.ClickException(
@@ -3160,7 +3166,8 @@ def canvas(
     else:
         text = _html_to_text(html_content)
         console.print(f"[bold]{title}[/]\n")
-        console.print(text)
+        # Canvas text can hold "[...]" that rich would parse as markup.
+        console.print(text, markup=False)
 
 
 @cli.command("canvas-edit", epilog="\b\nExamples:\n  slack-user canvas-edit F0123456789 \"## New Section\"\n  slack-user canvas-edit F0123456789 \"## Fresh Start\" --operation replace\n  slack-user canvas-edit F0123456789 \"## Header\" --operation insert_at_start\n  cat summary.md | slack-user canvas-edit F0123456789 --operation replace")
