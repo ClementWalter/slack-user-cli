@@ -267,7 +267,8 @@ slack-user dm <user_name_or_id> --limit 40 --keep-since 2026-05-29 --json
 thread. Nothing is posted and nobody else sees it: the user opens it, edits it
 and sends it himself. Prefer it over `send` whenever a reply is prepared for
 the user, since no approval is needed to create a draft. `<@U…>` in the text
-becomes a real mention.
+becomes a real mention, and `<url|name>`, `<url>` or `[name](url)` a rendered
+link (a draft is rich text, which would show the markup literally otherwise).
 
 ```bash
 slack-user draft <channel_name_or_id> "reply text"

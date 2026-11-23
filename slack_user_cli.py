@@ -2228,17 +2228,31 @@ def send(
 
 # -- drafts -------------------------------------------------------------------
 
-_MENTION_RE = re.compile(r"<@(U[A-Z0-9]+)>")
+# A mention, a Slack link (`<url|name>` or `<url>`) or a Markdown link (`[name](url)`), in draft text.
+_DRAFT_TOKEN_RE = re.compile(
+    r"<@(?P<user>U[A-Z0-9]+)>"
+    r"|<(?P<url>https?://[^|>\s]+)(?:\|(?P<label>[^>]*))?>"
+    r"|\[(?P<md_label>[^\]]+)\]\((?P<md_url>https?://[^)\s]+)\)"
+)
 
 
 def _draft_blocks(text: str) -> list[dict]:
-    """Rich-text blocks for a draft; `<@U…>` becomes a real mention, not literal text."""
+    """Rich-text blocks for a draft.
+
+    A draft is stored as rich text, which shows Slack's `<url|name>` markup literally, so mentions and links
+    become their own elements: `<@U…>` a user, and `<url|name>`, `<url>` or `[name](url)` a link.
+    """
     elements: list[dict] = []
     pos = 0
-    for m in _MENTION_RE.finditer(text):
+    for m in _DRAFT_TOKEN_RE.finditer(text):
         if m.start() > pos:
             elements.append({"type": "text", "text": text[pos : m.start()]})
-        elements.append({"type": "user", "user_id": m.group(1)})
+        if m.group("user"):
+            elements.append({"type": "user", "user_id": m.group("user")})
+        else:
+            url = m.group("url") or m.group("md_url")
+            label = m.group("label") or m.group("md_label")
+            elements.append({"type": "link", "url": url, **({"text": label} if label else {})})
         pos = m.end()
     if pos < len(text):
         elements.append({"type": "text", "text": text[pos:]})
@@ -2273,6 +2287,9 @@ def _draft_text(draft: dict) -> str:
             for el in section.get("elements", []):
                 if el.get("type") == "user":
                     parts.append(f"<@{el.get('user_id', '')}>")
+                elif el.get("type") == "link":
+                    label = el.get("text")
+                    parts.append(f"<{el.get('url', '')}|{label}>" if label else f"<{el.get('url', '')}>")
                 else:
                     parts.append(el.get("text", ""))
     return "".join(parts)
@@ -2296,7 +2313,8 @@ def draft(
     """Save MESSAGE as an unsent draft in CHANNEL (or a thread with --thread).
 
     Nothing is posted: the draft lands in Slack's "Drafts & Sent", where it is
-    edited and sent by hand. `<@U…>` in MESSAGE becomes a real mention.
+    edited and sent by hand. `<@U…>` in MESSAGE becomes a real mention, and
+    `<url|name>`, `<url>` or `[name](url)` a link.
     """
     client = get_client(workspace=ctx.obj["workspace"])
     ws = ctx.obj["workspace_name"]

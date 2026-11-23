@@ -2853,6 +2853,42 @@ class TestDraftBlocks:
 
         assert _draft_blocks("<@U12AB> yes")[0]["elements"][0]["elements"][1] == {"type": "text", "text": " yes"}
 
+    def test_slack_link_becomes_link_element(self):
+        from slack_user_cli import _draft_blocks
+
+        assert _draft_blocks("see <https://x.io/a|the doc>")[0]["elements"][0]["elements"][1] == {
+            "type": "link",
+            "url": "https://x.io/a",
+            "text": "the doc",
+        }
+
+    def test_bare_slack_link_becomes_link_element_without_text(self):
+        from slack_user_cli import _draft_blocks
+
+        assert _draft_blocks("<https://x.io/a>")[0]["elements"][0]["elements"][0] == {
+            "type": "link",
+            "url": "https://x.io/a",
+        }
+
+    def test_markdown_link_becomes_link_element(self):
+        from slack_user_cli import _draft_blocks
+
+        assert _draft_blocks("[the doc](https://x.io/a) here")[0]["elements"][0]["elements"][0] == {
+            "type": "link",
+            "url": "https://x.io/a",
+            "text": "the doc",
+        }
+
+    def test_text_after_link_is_kept(self):
+        from slack_user_cli import _draft_blocks
+
+        assert _draft_blocks("<https://x.io/a|doc> ok")[0]["elements"][0]["elements"][1] == {"type": "text", "text": " ok"}
+
+    def test_draft_text_flattens_a_link_back_to_slack_markup(self):
+        from slack_user_cli import _draft_text
+
+        assert _draft_text({"blocks": _draft_blocks_for_flatten()}) == "see <https://x.io/a|doc>"
+
 
 class TestDraftCommand:
     @patch("slack_user_cli.get_client")
@@ -2977,3 +3013,10 @@ class TestDraftReplace:
         mock_get_client.return_value = occupied_client
         result = runner.invoke(cli, ["draft", "general", "hi", "--thread", "9.1", "--replace", "--json"])
         assert json.loads(result.output)["id"] == "Dr9"
+
+
+def _draft_blocks_for_flatten() -> list[dict]:
+    """The blocks of a draft holding text then a labelled link."""
+    from slack_user_cli import _draft_blocks
+
+    return _draft_blocks("see <https://x.io/a|doc>")
